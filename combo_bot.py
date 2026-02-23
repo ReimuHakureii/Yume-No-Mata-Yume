@@ -1,21 +1,29 @@
 """
-SF6 World Tour Combo Bot v3
-Executes character combos via hotkeys using virtual gamepad simulation.
-Characters: Akuma, Chun-Li, Mai, Ken, Juri, Cammy, Ryu, Ed, JP
+SF6 Combo Bot v4
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Characters: Akuma, Chun-Li, Mai, Ken, Juri, Cammy, Ryu,
+            Ed, JP, Marisa, Luke, A.K.I., M. Bison
 
-Requires: vgamepad, keyboard, tkinter (built-in)
-Install deps: pip install vgamepad keyboard
-Also requires ViGEmBus driver: https://github.com/ViGEm/ViGEmBus/releases
+Requires:   pip install vgamepad keyboard
+            ViGEmBus driver: https://github.com/ViGEm/ViGEmBus/releases
 
-HOTKEYS (F1-F5 per selected character):
-  F1 = BnB #1
-  F2 = BnB #2
-  F3 = Punish #1
-  F4 = Punish #2 (OD/meter)
-  F5 = BnB into Super
+HOTKEYS
+  F1–F5  → Fire combo slot 1–5 for current character
+  F6     → Next character
+  F7     → Previous character
 
-  F6 = Cycle to next character
-  F7 = Cycle to previous character
+IMPROVEMENTS vs v3:
+  • Dedicated press_cr() helper eliminates repeated stick+button patterns
+  • hold_charge() helper cleanly implements charge-character mechanics
+  • od() wrapper is now a clean alias, no duplicate logic
+  • Combo slots expanded to 6 per character (added advanced slot on F6... wait,
+    F6 is char-switch — so combos remain F1-F5; added a 6th "Advanced" combo
+    accessible via the GUI "▶ Advanced" button per character)
+  • GUI: scrollable combo list, combo progress indicator, per-char notes panel
+  • Execution engine: cancellable mid-combo via ESC, queued re-fire guard
+  • Frame timing: per-input jitter compensation using time.perf_counter
+  • All existing combos reviewed and extended with more optimal routes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import vgamepad as vg
@@ -26,814 +34,1209 @@ import tkinter as tk
 from tkinter import ttk
 import sys
 
-# ─── Virtual Gamepad Setup ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  VIRTUAL GAMEPAD
+# ══════════════════════════════════════════════════════════════════════════════
+
 gamepad = None
+_cancel_flag = threading.Event()   # set this to abort a running combo mid-way
 
 def init_gamepad():
     global gamepad
     try:
         gamepad = vg.VX360Gamepad()
+        gamepad.update()
         return True
     except Exception as e:
         print(f"[ERROR] Could not init virtual gamepad: {e}")
-        print("Make sure ViGEmBus driver is installed.")
         return False
 
-# ─── Button Constants (Xbox layout) ───────────────────────────────────────────
-# SF6 Default Classic mapping (Xbox controller):
-# LP = X,  MP = Y,  HP = RB
-# LK = A,  MK = B,  HK = RT (right trigger)
-# Drive Impact = LB+RB  /  Parry = LT (left trigger)
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUTTON / AXIS CONSTANTS  (SF6 Classic, Xbox layout)
+#  LP=X  MP=Y  HP=RB  LK=A  MK=B  HK=RT  Parry=LT  DI=LB+RB
+# ══════════════════════════════════════════════════════════════════════════════
 
-BTN = {
+_BTN = {
     "LP": vg.XUSB_BUTTON.XUSB_GAMEPAD_X,
     "MP": vg.XUSB_BUTTON.XUSB_GAMEPAD_Y,
     "HP": vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER,
     "LK": vg.XUSB_BUTTON.XUSB_GAMEPAD_A,
     "MK": vg.XUSB_BUTTON.XUSB_GAMEPAD_B,
-    "HK": None,   # RT (trigger, handled separately)
-    "LT": None,   # LT (trigger, handled separately)
     "LB": vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER,
     "RB": vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER,
+    # HK  → right trigger (handled via _set_triggers)
+    # LT  → left trigger  (handled via _set_triggers)
 }
 
-STICK_MAX = 32767
+STICK_MAX =  32767
 STICK_MIN = -32768
 
-# ─── Low-level input helpers ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  TIMING ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-FRAME_SCALE = 1.0
+FRAME_SCALE = 1.0          # global timing multiplier — raise on slow CPUs
+FRAME_MS    = 16.667       # one frame at 60 fps
 
-def f(frames):
-    return frames * 0.0167 * FRAME_SCALE
+def _sleep(seconds: float):
+    """High-resolution sleep that also respects the cancel flag."""
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        if _cancel_flag.is_set():
+            raise InterruptedError("Combo cancelled")
+        time.sleep(0.001)
 
-def wait(ms):
-    time.sleep(ms / 1000.0)
+def f(frames: float) -> float:
+    """Convert frames to seconds, applying global scale."""
+    return frames * (FRAME_MS / 1000.0) * FRAME_SCALE
 
-def _set_stick(direction):
-    lx, ly = 0, 0
-    if "6" in direction: lx = STICK_MAX
-    if "4" in direction: lx = STICK_MIN
-    if "8" in direction: ly = STICK_MAX
-    if "2" in direction: ly = STICK_MIN
+def wait(ms: float):
+    """Wait a fixed number of milliseconds (also checks cancel flag)."""
+    _sleep(ms / 1000.0)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOW-LEVEL INPUT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _set_stick(direction: str):
+    """
+    Map numpad direction string to left stick X/Y.
+    Supports compound directions like '23', '46', etc.
+    """
+    lx = ly = 0
+    if "6" in direction: lx =  STICK_MAX
+    if "4" in direction: lx =  STICK_MIN
+    if "8" in direction: ly =  STICK_MAX
+    if "2" in direction: ly =  STICK_MIN
     gamepad.left_joystick(x_value=lx, y_value=ly)
 
-def press_buttons(*buttons, duration=0.05):
-    """Press one or more buttons simultaneously, then release."""
+def _set_triggers(hk: bool = False, lt: bool = False):
+    gamepad.right_trigger(value=255 if hk else 0)
+    gamepad.left_trigger(value=255 if lt else 0)
+
+def _press_raw(*buttons):
+    """Press buttons without releasing — for simultaneous multi-button holds."""
     for b in buttons:
-        if b == "HK":
-            gamepad.right_trigger(value=255)
-        elif b == "LT":
-            gamepad.left_trigger(value=255)
-        elif b in BTN and BTN[b]:
-            gamepad.press_button(button=BTN[b])
+        if b == "HK":  gamepad.right_trigger(value=255)
+        elif b == "LT": gamepad.left_trigger(value=255)
+        elif b in _BTN: gamepad.press_button(button=_BTN[b])
+
+def _release_raw(*buttons):
+    """Release buttons."""
+    for b in buttons:
+        if b == "HK":  gamepad.right_trigger(value=0)
+        elif b == "LT": gamepad.left_trigger(value=0)
+        elif b in _BTN: gamepad.release_button(button=_BTN[b])
+
+def press_buttons(*buttons, frames: float = 3):
+    """Press one or more buttons for `frames` frames, then release."""
+    _press_raw(*buttons)
     gamepad.update()
-    time.sleep(duration)
-    for b in buttons:
-        if b == "HK":
-            gamepad.right_trigger(value=0)
-        elif b == "LT":
-            gamepad.left_trigger(value=0)
-        elif b in BTN and BTN[b]:
-            gamepad.release_button(button=BTN[b])
+    _sleep(f(frames))
+    _release_raw(*buttons)
     gamepad.update()
 
-def press_od(*buttons, duration=0.05):
-    """Press OD (Overdrive/EX) version — two punches or two kicks simultaneously."""
-    # buttons should be a pair like ("LP","HP") or ("LK","HK")
-    press_buttons(*buttons, duration=duration)
+def od(*buttons, frames: float = 3):
+    """Alias for pressing two buttons simultaneously (Overdrive / EX move)."""
+    press_buttons(*buttons, frames=frames)
 
-def motion(direction, hold_frames=3):
+def motion(direction: str, frames: float = 3):
+    """Hold a stick direction for `frames` frames."""
     _set_stick(direction)
     gamepad.update()
-    time.sleep(hold_frames * 0.0167 * FRAME_SCALE)
+    _sleep(f(frames))
 
-def neutral(hold_frames=1):
+def neutral(frames: float = 1):
+    """Return stick to neutral for `frames` frames."""
     gamepad.left_joystick(x_value=0, y_value=0)
     gamepad.update()
-    time.sleep(hold_frames * 0.0167 * FRAME_SCALE)
+    _sleep(f(frames))
 
-def qcf(hold_frames=3):
-    """Quarter circle forward 236"""
-    motion("2", hold_frames)
-    motion("23", hold_frames)
-    motion("6", hold_frames)
+# ── Composite motion helpers ──────────────────────────────────────────────────
 
-def qcb(hold_frames=3):
-    """Quarter circle back 214"""
-    motion("2", hold_frames)
-    motion("24", hold_frames)
-    motion("4", hold_frames)
+def qcf(frames: float = 2):
+    """236 — Quarter circle forward."""
+    motion("2", frames); motion("23", frames); motion("6", frames)
 
-def dp(hold_frames=3):
-    """Dragon punch 623"""
-    motion("6", hold_frames)
-    motion("2", hold_frames)
-    motion("23", hold_frames)
+def qcb(frames: float = 2):
+    """214 — Quarter circle back."""
+    motion("2", frames); motion("24", frames); motion("4", frames)
 
-def rdp(hold_frames=3):
-    """Reverse dragon punch 421"""
-    motion("4", hold_frames)
-    motion("2", hold_frames)
-    motion("24", hold_frames)
+def dp(frames: float = 2):
+    """623 — Dragon punch (Shoryuken) motion."""
+    motion("6", frames); motion("2", frames); motion("23", frames)
 
-def hcf(hold_frames=3):
-    """Half circle forward 41236"""
-    motion("4", hold_frames)
-    motion("24", hold_frames)
-    motion("2", hold_frames)
-    motion("23", hold_frames)
-    motion("6", hold_frames)
+def rdp(frames: float = 2):
+    """421 — Reverse dragon punch."""
+    motion("4", frames); motion("2", frames); motion("24", frames)
 
-def hcb(hold_frames=3):
-    """Half circle back 63214"""
-    motion("6", hold_frames)
-    motion("62", hold_frames)
-    motion("2", hold_frames)
-    motion("24", hold_frames)
-    motion("4", hold_frames)
+def hcf(frames: float = 2):
+    """41236 — Half circle forward."""
+    motion("4", frames); motion("24", frames); motion("2", frames)
+    motion("23", frames); motion("6", frames)
 
-def cr_press(*buttons, duration_frames=3):
-    """Press buttons while crouching (hold 2)."""
+def hcb(frames: float = 2):
+    """63214 — Half circle back."""
+    motion("6", frames); motion("62", frames); motion("2", frames)
+    motion("24", frames); motion("4", frames)
+
+def hold_charge(direction: str, frames: float = 8):
+    """
+    Hold a charge direction for `frames` frames.
+    Use before charge specials (Chun SBK, Bison Scissors, etc.)
+    """
+    motion(direction, frames)
+
+# ── Shorthand normal helpers ──────────────────────────────────────────────────
+
+def cr(*buttons, frames: float = 3):
+    """Press buttons while crouching (stick held at 2)."""
     motion("2", 2)
-    press_buttons(*buttons, duration=f(duration_frames))
+    press_buttons(*buttons, frames=frames)
 
-def cr_cancel_into(motion_fn, *buttons):
-    """Perform a crouching normal and immediately cancel into a special motion+button."""
-    motion_fn()
-    press_buttons(*buttons, duration=f(3))
-    neutral()
+def st(*buttons, frames: float = 3):
+    """Press buttons from standing (neutral)."""
+    neutral(1)
+    press_buttons(*buttons, frames=frames)
+
+def link(ms: float = 50):
+    """Pause between linked normals (not cancel — let the move recover)."""
+    neutral(2)
+    wait(ms)
+
+def cancel(ms: float = 20):
+    """Short pause before a special cancel (tighter than a link)."""
+    wait(ms)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AKUMA COMBOS
+#  ▓▓  AKUMA  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
+# Gohadouken (QCF+P) · Goshoryuken (623+P) · Zanku Hadouken (air QCF+P)
+# Tatsumaki Zankukyaku (QCB+K) · Hyakkishu (214+K flip)
+# Supers: Messatsu-Goshoryuken (236236+P) Lv1 · Messatsu-Goshoryu (214214+P) Lv2
+#         Shin Shun Goku Satsu (214214+LP+MP) Lv3
 
 def akuma_bnb_1():
-    """cr.MP xx cr.MP xx HP Goshoryuken — Meterless BnB, safe cancel window."""
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(30)
-    dp(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.MP > cr.MP xx HP Goshoryuken — Meterless BnB, core cancel."""
+    cr("MP"); link(45)
+    cr("MP"); cancel(25)
+    dp(); press_buttons("HP"); neutral()
 
 def akuma_bnb_2():
-    """cr.LK > cr.LP > cr.MP xx Gohadouken (QCF+HP) — Low starter BnB."""
-    motion("2", 2); press_buttons("LK", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MP", duration=f(3))
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.LK > cr.LP > cr.MP xx Gohadouken (QCF+HP) — Low starter confirm."""
+    cr("LK", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MP"); cancel(20)
+    qcf(); press_buttons("HP"); neutral()
 
 def akuma_punish_1():
-    """st.HP xx HP Goshoryuken — Large punish window, heavy damage."""
-    press_buttons("HP", duration=f(4)); wait(40)
-    dp(2); press_buttons("HP", duration=f(3)); neutral()
+    """st.HP xx HP Goshoryuken — Biggest meterless punish window."""
+    st("HP", frames=4); cancel(35)
+    dp(); press_buttons("HP"); neutral()
 
 def akuma_punish_2():
-    """cr.MP > st.HP xx OD Goshoryuken > juggle HP DP — Full meter punish."""
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(40)
-    dp(2); press_od("LP", "HP", duration=f(3))
-    wait(200)
-    dp(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD Goshoryuken > juggle HP DP — Full Drive punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(35)
+    dp(); od("LP", "HP"); neutral()
+    wait(180)
+    dp(); press_buttons("HP"); neutral()
 
-def akuma_bnb_super():
-    """cr.MP > cr.HP xx Messatsu-Goshoryu (214214+HP) — BnB into Level 2 Super."""
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    motion("2", 2); press_buttons("HP", duration=f(4)); wait(30)
-    qcb(2); qcb(2); press_buttons("HP", duration=f(3)); neutral()
+def akuma_super_1():
+    """cr.MP > cr.HP xx Messatsu-Goshoryuken (236236+HP) Lv1 — Fast super route."""
+    cr("MP"); link(40)
+    cr("HP", frames=4); cancel(25)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def akuma_advanced():
+    """
+    ADVANCED — cr.LK > cr.LP > cr.MP > st.HP xx OD Tatsumaki > juggle HP DP
+    Full Drive punish off a low starter. Cancel window is tight.
+    OD Tatsumaki (QCB+MK+HK) wallsplats in corner for a juggle HP DP.
+    """
+    cr("LK", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    qcb(); od("MK", "HK")
+    wait(260)
+    dp(); press_buttons("HP"); neutral()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CHUN-LI COMBOS
+#  ▓▓  CHUN-LI  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
+# Kikoken (QCF+P) · SBK/Spinning Bird Kick (charge 4→6+K)
+# Hyakuretsukyaku (rapid HK) · Hazan Shu (charge 2→8+K, overhead)
+# Super: Kikosho (236236+P) Lv1 · Hoyokusen (236236+K) Lv2
 
 def chunli_bnb_1():
     """cr.MK xx Spinning Bird Kick (charge 4→6+HK) — Classic charge BnB."""
-    motion("4", 8)
-    motion("2", 2); press_buttons("MK", duration=f(3))
-    motion("6", 2); press_buttons("HK", duration=f(3)); neutral()
+    hold_charge("4", 10)
+    motion("2", 2); press_buttons("MK", frames=3)   # cr.MK while holding charge
+    motion("6", 2); press_buttons("HK"); neutral()  # release charge into SBK
 
 def chunli_bnb_2():
-    """cr.LP > cr.LP > cr.MK xx Kikoken (QCF+HP) — Meterless poke BnB."""
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.LP > cr.LP > cr.MK xx Kikoken (QCF+HP) — Meterless poke confirm."""
+    cr("LP", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("HP"); neutral()
 
 def chunli_punish_1():
-    """st.MP > st.HP xx Hyakuretsukyaku (rapid HK) — Standard punish into legs."""
-    press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    for _ in range(5):
-        press_buttons("HK", duration=f(2)); wait(30)
+    """st.MP > st.HP xx Hyakuretsukyaku — Standard punish, rapid legs ender."""
+    st("MP"); link(45)
+    st("HP", frames=4); cancel(25)
+    for _ in range(6):
+        press_buttons("HK", frames=2); wait(25)
     neutral()
 
 def chunli_punish_2():
-    """cr.MP > st.HP xx OD SBK > juggle HP — Full meter corner carry punish."""
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    motion("4", 6); motion("6", 2)
-    press_od("MK", "HK", duration=f(3))
-    wait(250); press_buttons("HP", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD SBK (charge) > juggle HP — Corner carry punish."""
+    hold_charge("4", 6)
+    motion("2", 2); press_buttons("MP", frames=3); neutral(2); wait(45)
+    st("HP", frames=4); cancel(28)
+    motion("4", 5); motion("6", 2)
+    od("MK", "HK")
+    wait(240); st("HP"); neutral()
 
-def chunli_bnb_super():
-    """cr.MP > cr.HP xx Kikosho (236236+HP) — BnB into Level 1 Super."""
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    motion("2", 2); press_buttons("HP", duration=f(4)); wait(30)
-    qcf(2); qcf(2); press_buttons("HP", duration=f(3)); neutral()
+def chunli_super_1():
+    """cr.MP > cr.HP xx Kikosho (236236+HP) Lv1 — BnB into fast super."""
+    cr("MP"); link(45)
+    cr("HP", frames=4); cancel(25)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def chunli_advanced():
+    """
+    ADVANCED — cr.LP > cr.LP > cr.MK xx OD SBK (charge) > Hazan Shu > Hoyokusen Lv2
+    Full meter route: OD SBK launches, then Hazan Shu (charge 2→8+HK) juggles,
+    cancelled into Hoyokusen (236236+HK) for maximum damage.
+    Requires charge built before combo starts (hold back during approach).
+    """
+    hold_charge("4", 8)
+    cr("LP", frames=2); link(30)
+    cr("LP", frames=2); link(30)
+    cr("MK"); cancel(20)
+    motion("4", 5); motion("6", 2); od("MK", "HK")   # OD SBK
+    wait(200)
+    # Hazan Shu: charge 2→8+HK
+    motion("2", 6); motion("8", 2); press_buttons("HK"); neutral()
+    wait(180)
+    qcf(); qcf(); press_buttons("HK"); neutral()       # Hoyokusen Lv2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAI COMBOS
+#  ▓▓  MAI  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# Mai is a rushdown/fireball character with strong oki and fan-based specials.
-# Key moves: Kachousen (QCF+P fireball), Ryuuenbu (QCB+K spin),
-#            Musasabi no Mai (hold 4→6+K wall dive), Hissatsu Shinobibachi (Super)
-# Note: Mai has a unique "Shiranui" Stance on HCB+K which leads to mix-ups.
+# Kachousen (QCF+P fan fireball) · Ryuuenbu (QCB+K spinning fire)
+# Musasabi no Mai (hold 4→6+K wall dive) · Chou Midare Kachousen (air)
+# Super: Hissatsu Shinobibachi (236236+K) Lv1 · Sen'en Ryuuenbu (214214+K) Lv2
 
 def mai_bnb_1():
-    """
-    Mai BnB #1 — cr.LK > cr.LP > st.MP xx Kachousen (QCF+HP)
-    Fast low starter into confirm. Solid damage, leaves fan on screen.
-    """
-    motion("2", 2); press_buttons("LK", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    press_buttons("MP", duration=f(3)); wait(30)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.LK > cr.LP > st.MP xx Kachousen (QCF+HP) — Low starter into fan."""
+    cr("LK", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    st("MP"); cancel(25)
+    qcf(); press_buttons("HP"); neutral()
 
 def mai_bnb_2():
-    """
-    Mai BnB #2 — st.MP > st.HP xx Ryuuenbu (QCB+HK)
-    Midrange punish and pressure combo. Ryuuenbu has great corner carry.
-    """
-    press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    qcb(2); press_buttons("HK", duration=f(3)); neutral()
+    """st.MP > st.HP xx Ryuuenbu (QCB+HK) — Mid-range BnB, corner carry."""
+    st("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcb(); press_buttons("HK"); neutral()
 
 def mai_punish_1():
-    """
-    Mai Punish #1 — cr.MP > st.HP xx Kachousen (QCF+HP)
-    Reliable punish on large whiffs. Good damage and safe on block with fan.
-    """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.MP > st.HP xx Kachousen (QCF+HP) — Reliable whiff punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("HP"); neutral()
 
 def mai_punish_2():
-    """
-    Mai Optimal Punish #2 — cr.MP > st.HP xx OD Ryuuenbu > juggle st.HP
-    Spends Drive Meter for maximum damage and corner carry.
-    OD Ryuuenbu (QCB + MK+HK) launches for juggle opportunity.
-    """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    # OD Ryuuenbu: QCB + MK+HK
-    qcb(2); press_od("MK", "HK", duration=f(3))
-    wait(220)
-    # Juggle follow-up
-    press_buttons("HP", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD Ryuuenbu > juggle st.HP > Kachousen — Extended punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcb(); od("MK", "HK")
+    wait(200)
+    st("HP", frames=4); cancel(25)
+    qcf(); press_buttons("HP"); neutral()
 
-def mai_bnb_super():
+def mai_super_1():
+    """cr.MP > st.HP xx Hissatsu Shinobibachi (236236+HK) Lv1."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); qcf(); press_buttons("HK"); neutral()
+
+def mai_advanced():
     """
-    Mai BnB into Super — cr.MP > st.HP xx Hissatsu Shinobibachi (236236+K)
-    Mai's Level 1 Super. Massive damage, great combo ender from almost any starter.
+    ADVANCED — cr.LK > cr.LP > st.MP > st.HP xx OD Ryuuenbu > juggle HP
+               xx Sen'en Ryuuenbu (214214+HK) Lv2
+    Full meter punish off a low starter. OD Ryuuenbu launches, juggle HP
+    cancelled into Lv2 Super for screen-clearing damage.
     """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    # Super: 236236+HK
-    qcf(2); qcf(2); press_buttons("HK", duration=f(3)); neutral()
+    cr("LK", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    st("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcb(); od("MK", "HK")
+    wait(200)
+    st("HP", frames=4); cancel(25)
+    qcb(); qcb(); press_buttons("HK"); neutral()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  KEN COMBOS
+#  ▓▓  KEN  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# Ken is an aggressive rushdown character. Key moves:
-# Hadouken (QCF+P), Shoryuken (623+P), Tatsumaki (QCB+K),
-# Jinrai Kick (236+K) — target combo chain, very important for his gameplan.
-# Super: Shinryuken (236236+P) Level 1 or Shippu Jinraikyaku (236236+K) Level 3
+# Hadouken (QCF+P) · Shoryuken (623+P) · Tatsumaki (QCB+K)
+# Jinrai Kick (236+K) — 3-part target combo chain
+# Super: Shinryuken (236236+P) Lv1 · Shippu Jinraikyaku (236236+K) Lv3
 
 def ken_bnb_1():
-    """
-    Ken BnB #1 — cr.MK xx Hadouken (QCF+HP)
-    Fundamental Ken combo. Safe on block, great for neutral control.
-    """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.MK xx Hadouken (QCF+HP) — Fundamental, safe fireball cancel."""
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("HP"); neutral()
 
 def ken_bnb_2():
-    """
-    Ken BnB #2 — cr.LP > cr.LP > cr.MK xx Jinrai Kick (236+MK)
-    Low starter into target combo setup. Jinrai Kick leads to follow-ups.
-    """
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    # Jinrai Kick: 236+MK
-    qcf(2); press_buttons("MK", duration=f(3)); neutral()
+    """cr.LP > cr.LP > cr.MK xx Jinrai Kick (236+MK) — Low starter chain."""
+    cr("LP", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("MK"); neutral()
 
 def ken_punish_1():
-    """
-    Ken Punish #1 — st.MP > st.HP xx HP Shoryuken (623+HP)
-    Classic Ken punish. Massive damage on big openings.
-    """
-    press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(35)
-    dp(2); press_buttons("HP", duration=f(3)); neutral()
+    """st.MP > st.HP xx HP Shoryuken (623+HP) — Classic Ken punish."""
+    st("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    dp(); press_buttons("HP"); neutral()
 
 def ken_punish_2():
-    """
-    Ken Optimal Punish #2 — cr.MP > st.HP xx OD Shoryuken > juggle Tatsumaki (QCB+HK)
-    Full Drive Meter spend for maximum damage. OD DP launches into juggle.
-    """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(35)
-    # OD Shoryuken: 623 + LP+HP
-    dp(2); press_od("LP", "HP", duration=f(3))
-    wait(280)
-    # Juggle: Tatsumaki Senpukyaku QCB+HK
-    qcb(2); press_buttons("HK", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD Shoryuken > juggle Tatsumaki (QCB+HK)."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
+    wait(260)
+    qcb(); press_buttons("HK"); neutral()
 
-def ken_bnb_super():
+def ken_super_1():
+    """cr.MK xx Shinryuken (236236+HP) Lv1 — Fastest super route."""
+    cr("MK"); cancel(20)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def ken_advanced():
     """
-    Ken BnB into Super — cr.MK xx Shinryuken (236236+HP) — Level 1 Super
-    Ken's fastest route into super. Huge damage, great cinematic ender.
+    ADVANCED — st.MP > st.HP xx OD Shoryuken > juggle Jinrai MK > Jinrai HK
+               > Jinrai HP xx Shinryuken Lv1
+    Full Drive + Super combo. OD DP launches; Jinrai follow-up chain
+    (236+MK → auto-follow MK → HP) cancels into Shinryuken for max damage.
+    The Jinrai chain auto-follows on hit — just re-fire QCF+MK twice after landing.
     """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    # Level 1 Super Shinryuken: 236236+HP
-    qcf(2); qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    st("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
+    wait(250)
+    # Jinrai first hit
+    qcf(); press_buttons("MK")
+    wait(80)
+    # Jinrai second hit (auto-follow)
+    press_buttons("MK")
+    wait(80)
+    # Jinrai third hit cancelled into super
+    press_buttons("HP"); cancel(20)
+    qcf(); qcf(); press_buttons("HP"); neutral()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  JURI COMBOS
+#  ▓▓  JURI  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# Juri is a unique charge/store character. Her Fuha stocks (236+K) store fireballs,
-# releasing with 236+K again. Her gameplan revolves around storing and releasing Fuha
-# to power up her normals and extend combos.
-# Key specials: Fuha Store/Release (236+K), Saihasho (QCF+LP release),
-#               Shiku-sen (236+K dive kick), Feng Shui Engine Super (214214+K)
-# NOTE: These combos assume Juri has at least 1 Fuha stock stored before use
-#       where indicated. Store a stock first with 236+LK before starting.
+# Fuha Stock (236+K — store) / Release (236+K again — different K = release)
+# Shiku-sen (236+K dive kick) · Saihasho / Ankensatsu / Kaisen Dankairaku releases
+# Super: Feng Shui Engine (214214+LK) Lv1 · Feng Shui Engine Omega (214214+HK) Lv3
+# NOTE: F1/F3/F6 require a pre-stored Fuha stock (press 236+LK in neutral first).
 
 def juri_bnb_1():
-    """
-    Juri BnB #1 — cr.MK > st.HP xx Saihasho (QCF+LP Fuha release)
-    Solid meterless BnB assuming 1 Fuha stock is pre-stored.
-    If no stock, ends after st.HP for less damage.
-    """
-    motion("2", 2); press_buttons("MK", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    # Fuha release: QCF + LP
-    qcf(2); press_buttons("LP", duration=f(3)); neutral()
+    """cr.MK > st.HP xx Fuha Release LP (QCF+LP) — Needs 1 stock."""
+    cr("MK"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("LP"); neutral()
 
 def juri_bnb_2():
-    """
-    Juri BnB #2 — cr.LP > cr.LP > cr.MK xx Shiku-sen (236+MK dive kick)
-    Low starter BnB. Shiku-sen is a fast angled kick that combos from cr.MK.
-    """
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(25)
-    # Shiku-sen: 236+MK
-    qcf(2); press_buttons("MK", duration=f(3)); neutral()
+    """cr.LP > cr.LP > cr.MK xx Shiku-sen (QCF+MK) — No stock needed."""
+    cr("LP", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MK"); cancel(22)
+    qcf(); press_buttons("MK"); neutral()
 
 def juri_punish_1():
-    """
-    Juri Punish #1 — st.HP xx Saihasho (QCF+HP Fuha release)
-    Simple high-damage punish. HP version of Fuha release travels full screen.
-    Requires 1 stored Fuha stock.
-    """
-    press_buttons("HP", duration=f(4)); wait(30)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """st.HP xx Fuha Release HP (QCF+HP) — Full-screen punish. Needs 1 stock."""
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("HP"); neutral()
 
 def juri_punish_2():
-    """
-    Juri Optimal Punish #2 — cr.MP > st.HP xx OD Shiku-sen > cr.HP > Fuha release
-    Full meter punish with Fuha extension. OD Shiku-sen (236+MK+HK) launches.
-    Requires Drive Meter + 1 Fuha stock for ender.
-    """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    # OD Shiku-sen: 236 + MK+HK
-    qcf(2); press_od("MK", "HK", duration=f(3))
-    wait(200)
-    # Juggle: cr.HP
-    motion("2", 2); press_buttons("HP", duration=f(4)); neutral(2); wait(50)
-    # Fuha release ender: QCF+LP
-    qcf(2); press_buttons("LP", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD Shiku-sen > cr.HP > Fuha Release LP — Drive punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); od("MK", "HK")
+    wait(190)
+    cr("HP", frames=4); cancel(25)
+    qcf(); press_buttons("LP"); neutral()
 
-def juri_bnb_super():
+def juri_super_1():
+    """cr.MK > st.HP xx Feng Shui Engine (214214+LK) Lv1 — Activates powered state."""
+    cr("MK"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcb(); qcb(); press_buttons("LK"); neutral()
+
+def juri_advanced():
     """
-    Juri BnB into Super — cr.MK > st.HP xx Feng Shui Engine (214214+LK)
-    Juri's Level 1 Super activates Feng Shui Engine for powered-up state.
-    Combo into it for guaranteed activation and pressure setup.
+    ADVANCED — cr.LP > cr.MK > st.HP xx OD Shiku-sen > cr.HP xx Fuha HP Release
+               > Feng Shui Engine Omega (214214+HK) Lv3
+    Full meter + Lv3 super route off a low starter. Needs 1 stored Fuha stock.
+    Fuha release extends the juggle; Lv3 super is then activated for massive damage.
     """
-    motion("2", 2); press_buttons("MK", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(30)
-    # Feng Shui Engine: 214214+LK
-    qcb(2); qcb(2); press_buttons("LK", duration=f(3)); neutral()
+    cr("LP", frames=2); link(35)
+    cr("MK"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); od("MK", "HK")
+    wait(190)
+    cr("HP", frames=4); cancel(25)
+    qcf(); press_buttons("HP")           # Fuha HP release
+    wait(150)
+    qcb(); qcb(); press_buttons("HK"); neutral()   # Lv3 super
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CAMMY COMBOS
+#  ▓▓  CAMMY  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# Cammy is a fast, rushdown/mixup character with strong pressure and oki.
-# Key specials: Spiral Arrow (QCF+K — dive kick), Cannon Spike (623+K — DP),
-#               Hooligan Combination (QCB+P), Quick Spin Knuckle (236+P).
-# Super: Cammy Spin Drive Smasher (236236+K) Lv1, Delta Red Assault (236236+P) Lv2
-# Her combos revolve around cr.MK xx Spiral Arrow as the core cancel route.
+# Spiral Arrow (QCF+K) · Cannon Spike (623+K) · Quick Spin Knuckle (236+P)
+# Hooligan Combination (QCB+P) · Delta Red Combination (target combo)
+# Super: Spin Drive Smasher (236236+K) Lv1 · Delta Red Assault (236236+P) Lv2
 
 def cammy_bnb_1():
-    """
-    Cammy BnB #1 — cr.LK > cr.LP > cr.MK xx Spiral Arrow (QCF+MK)
-    Fast low starter into her signature slide. Safe on block at range.
-    """
-    motion("2", 2); press_buttons("LK", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); press_buttons("MK", duration=f(3)); neutral()
+    """cr.LK > cr.LP > cr.MK xx Spiral Arrow MK (QCF+MK) — Low starter."""
+    cr("LK", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("MK"); neutral()
 
 def cammy_bnb_2():
-    """
-    Cammy BnB #2 — st.MP > st.MP > cr.MK xx Spiral Arrow (QCF+HK)
-    Target combo chain into HK Spiral Arrow. Great damage meterless.
-    st.MP > st.MP is a target combo (auto-chain on the second hit).
-    """
-    press_buttons("MP", duration=f(3)); neutral(1); wait(35)
-    press_buttons("MP", duration=f(3)); neutral(2); wait(40)
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); press_buttons("HK", duration=f(3)); neutral()
+    """st.MP > st.MP > cr.MK xx Spiral Arrow HK — Target combo into HK slide."""
+    st("MP"); link(35)
+    st("MP"); link(40)    # second hit of target combo
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("HK"); neutral()
 
 def cammy_punish_1():
-    """
-    Cammy Punish #1 — st.HP xx Cannon Spike (623+HK)
-    Bread-and-butter punish on large openings. Cannon Spike is a hard knockdown.
-    """
-    press_buttons("HP", duration=f(4)); wait(35)
-    dp(2); press_buttons("HK", duration=f(3)); neutral()
+    """st.HP xx Cannon Spike (623+HK) — Hard knockdown punish."""
+    st("HP", frames=4); cancel(30)
+    dp(); press_buttons("HK"); neutral()
 
 def cammy_punish_2():
+    """cr.MP > st.HP xx OD Spiral Arrow > juggle Cannon Spike — Drive punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    qcf(); od("MK", "HK")
+    wait(210)
+    dp(); press_buttons("HK"); neutral()
+
+def cammy_super_1():
+    """cr.MK xx Spin Drive Smasher (236236+HK) Lv1 — Fast super route."""
+    cr("MK"); cancel(20)
+    qcf(); qcf(); press_buttons("HK"); neutral()
+
+def cammy_advanced():
     """
-    Cammy Optimal Punish #2 — cr.MP > st.HP xx OD Spiral Arrow > Cannon Spike juggle
-    OD Spiral Arrow (QCF+MK+HK) launches for a juggle Cannon Spike follow-up.
-    Spends one bar of Drive Meter. Maximum meterless-into-OD damage.
+    ADVANCED — cr.LP > cr.LP > st.MP > st.MP > cr.HP xx OD Cannon Spike
+               > juggle Quick Spin Knuckle (236+HP) xx Delta Red Assault Lv2
+    Long low-starter chain into OD Cannon Spike launcher, QSK juggle cancelled
+    into Lv2 super. Hardest Cammy combo — tight cancel window on cr.HP.
     """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(35)
-    # OD Spiral Arrow: QCF + MK+HK
-    qcf(2); press_od("MK", "HK", duration=f(3))
+    cr("LP", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    st("MP"); link(35)
+    st("MP"); link(38)
+    cr("HP", frames=4); cancel(28)
+    dp(); od("LK", "HK")         # OD Cannon Spike (623+LK+HK)
     wait(220)
-    # Juggle: Cannon Spike 623+HK
-    dp(2); press_buttons("HK", duration=f(3)); neutral()
-
-def cammy_bnb_super():
-    """
-    Cammy BnB into Super — cr.MK xx Spin Drive Smasher (236236+HK) Lv1
-    Fast route into her Level 1 Super. Massive damage, cinematic finisher.
-    """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); qcf(2); press_buttons("HK", duration=f(3)); neutral()
+    # Quick Spin Knuckle juggle: 236+HP
+    qcf(); press_buttons("HP"); cancel(25)
+    # Delta Red Assault Lv2: 236236+LP
+    qcf(); qcf(); press_buttons("LP"); neutral()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RYU COMBOS
+#  ▓▓  RYU  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# Ryu is the quintessential SF character — balanced, fundamental-based.
-# Key specials: Hadouken (QCF+P), Shoryuken (623+P), Tatsumaki (QCB+K),
-#               Hashogeki (236+P — palm strike, chargeable), Denjin Charge (hold HP+HK).
-# Super: Shin Hashogeki (236236+P) Lv1, Shin Shoryuken (236236+P Lv3)
-# Ryu's combos are clean and punish-focused. Shoryuken is his best ender.
+# Hadouken (QCF+P) · Shoryuken (623+P) · Tatsumaki (QCB+K)
+# Hashogeki (236+P palm, chargeable) · Denjin Charge (hold HP+HK)
+# Super: Shin Hashogeki (236236+P) Lv1 · Shin Shoryuken (236236+HP hold) Lv3
 
 def ryu_bnb_1():
-    """
-    Ryu BnB #1 — cr.MK xx Hadouken (QCF+HP)
-    The most fundamental SF combo ever. Safe fireball cancel from a poke.
-    """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.MK xx Hadouken (QCF+HP) — The most classic SF combo."""
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("HP"); neutral()
 
 def ryu_bnb_2():
-    """
-    Ryu BnB #2 — cr.LP > cr.LP > cr.MK xx Hashogeki (236+HP palm)
-    Low starter into Hashogeki palm strike. More plus-on-hit than Hadouken.
-    """
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    # Hashogeki: 236+HP
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """cr.LP > cr.LP > cr.MK xx Hashogeki (236+HP) — Low starter into palm."""
+    cr("LP", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("HP"); neutral()
 
 def ryu_punish_1():
-    """
-    Ryu Punish #1 — st.HP xx HP Shoryuken (623+HP)
-    Classic big punish. st.HP into Shoryuken is Ryu's best meterless damage.
-    """
-    press_buttons("HP", duration=f(4)); wait(35)
-    dp(2); press_buttons("HP", duration=f(3)); neutral()
+    """st.HP xx HP Shoryuken (623+HP) — Maximum meterless punish."""
+    st("HP", frames=4); cancel(30)
+    dp(); press_buttons("HP"); neutral()
 
 def ryu_punish_2():
-    """
-    Ryu Optimal Punish #2 — cr.MP > st.HP xx OD Shoryuken > juggle Tatsumaki (QCB+HK)
-    OD Shoryuken (623+LP+HP) launches. Tatsumaki juggle adds solid damage.
-    Costs one Drive bar. Best damage punish in his kit.
-    """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(35)
-    # OD Shoryuken: 623 + LP+HP
-    dp(2); press_od("LP", "HP", duration=f(3))
-    wait(270)
-    # Juggle: Tatsumaki QCB+HK
-    qcb(2); press_buttons("HK", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD Shoryuken > juggle Tatsumaki (QCB+HK)."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
+    wait(260)
+    qcb(); press_buttons("HK"); neutral()
 
-def ryu_bnb_super():
+def ryu_super_1():
+    """cr.MK xx Shin Hashogeki (236236+HP) Lv1 — Fast super ender."""
+    cr("MK"); cancel(20)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def ryu_advanced():
     """
-    Ryu BnB into Super — cr.MK xx Shin Hashogeki (236236+HP) Lv1
-    Ryu's fastest super route. Level 1 Shin Hashogeki is a full-screen palm blast.
+    ADVANCED — cr.MP > st.HP xx OD Shoryuken > juggle Tatsumaki (QCB+HK)
+               xx Shin Shoryuken (236236+HP hold) Lv3
+    Full Drive + Lv3 Super. Tatsumaki juggle is cancelled into Lv3 Shin Shoryuken
+    for a devastating wall-bounce combo. The held HP activates the powered version.
+    Requires full Drive Gauge + Lv3 super meter.
     """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
+    wait(260)
+    qcb(); press_buttons("HK"); cancel(30)
+    # Shin Shoryuken Lv3: 236236 + HP (hold)
+    qcf(); qcf()
+    # Hold HP for powered version
+    _press_raw("HP"); gamepad.update()
+    _sleep(f(20))                  # hold for ~20 frames = powered Shin Shoryuken
+    _release_raw("HP"); gamepad.update()
+    neutral()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ED COMBOS
+#  ▓▓  ED  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# Ed is a Psycho Power rushdown character with unique motion inputs —
-# most of his specials use *hold-then-release* or charge mechanics rather
-# than traditional QCF/DP motions, making him one of the easiest characters
-# to execute optimally.
-# Key specials:
-#   Psycho Spark     — hold back, forward + P  (projectile)
-#   Psycho Blitz     — hold back, forward + K  (rush punch)
-#   Psycho Upper     — hold down, up + P       (uppercut / anti-air)
-#   Flicker          — 236 + P                 (quick jab series)
-# Super: Psycho Cannon Barrage (236236+P) Lv1, Psycho Seize (hold then release)
-# NOTE: Ed's charge inputs are simplified here using hold-motion sequences.
+# Ed uses hold-release charge mechanics:
+#   Psycho Spark   — hold 4, tap 6+P   (projectile)
+#   Psycho Blitz   — hold 4, tap 6+K   (rush punch)
+#   Psycho Upper   — hold 2, tap 8+P   (uppercut/DP)
+#   Flicker        — 236+P             (quick jab)
+# Super: Psycho Cannon Barrage (236236+P) Lv1
 
 def ed_bnb_1():
-    """
-    Ed BnB #1 — cr.LP > cr.LP > st.MP xx Psycho Blitz (hold 4→6+MK)
-    Easy low starter. Psycho Blitz is his main cancel target. Charge held during normals.
-    """
-    # Build charge during the normals (hold back)
-    motion("4", 2)
-    motion("24", 1); press_buttons("LP", duration=f(2)); wait(35)
-    motion("24", 1); press_buttons("LP", duration=f(2)); wait(35)
-    # st.MP (release back briefly, re-engage charge during recovery)
-    motion("4", 3); press_buttons("MP", duration=f(3)); wait(25)
-    # Psycho Blitz: hold 4 → 6 + MK
-    motion("4", 4); motion("6", 2); press_buttons("MK", duration=f(3)); neutral()
+    """cr.LP > cr.LP > st.MP xx Psycho Blitz (hold 4→6+MK) — Easy low starter."""
+    hold_charge("4", 3)
+    motion("24", 1); press_buttons("LP", frames=2); wait(35)
+    motion("24", 1); press_buttons("LP", frames=2); wait(35)
+    motion("4", 4); press_buttons("MP", frames=3); wait(25)
+    motion("4", 5); motion("6", 2); press_buttons("MK"); neutral()
 
 def ed_bnb_2():
-    """
-    Ed BnB #2 — cr.MK xx Flicker (236+LP) > Psycho Spark (hold 4→6+HP)
-    Flicker chains into Spark for a double-cancel combo. Decent corner carry.
-    """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    # Flicker: 236+LP
-    qcf(2); press_buttons("LP", duration=f(3))
+    """cr.MK xx Flicker (236+LP) > Psycho Spark (hold 4→6+HP) — Double cancel."""
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("LP")
     wait(80)
-    # Psycho Spark: hold 4 → 6 + HP
-    motion("4", 5); motion("6", 2); press_buttons("HP", duration=f(3)); neutral()
+    motion("4", 5); motion("6", 2); press_buttons("HP"); neutral()
 
 def ed_punish_1():
-    """
-    Ed Punish #1 — st.HP xx Psycho Upper (hold 2→8+HP)
-    Straightforward punish. Psycho Upper is Ed's DP equivalent — great damage.
-    """
-    press_buttons("HP", duration=f(4)); wait(35)
-    # Psycho Upper: hold 2 → 8 + HP
-    motion("2", 6); motion("8", 2); press_buttons("HP", duration=f(3)); neutral()
+    """st.HP xx Psycho Upper (hold 2→8+HP) — DP-equivalent punish."""
+    st("HP", frames=4); cancel(30)
+    motion("2", 6); motion("8", 2); press_buttons("HP"); neutral()
 
 def ed_punish_2():
-    """
-    Ed Optimal Punish #2 — cr.MP > st.HP xx OD Psycho Upper > juggle Psycho Blitz
-    OD Psycho Upper (hold 2→8 + LP+HP) launches for a juggle follow-up.
-    Costs one Drive bar. Ed's highest damage punish route.
-    """
-    motion("2", 2); press_buttons("MP", duration=f(3)); neutral(2); wait(50)
-    press_buttons("HP", duration=f(4)); wait(35)
-    # OD Psycho Upper: hold 2 → 8 + LP+HP
-    motion("2", 6); motion("8", 2); press_od("LP", "HP", duration=f(3))
-    wait(240)
-    # Juggle: Psycho Blitz hold 4→6+HK
-    motion("4", 4); motion("6", 2); press_buttons("HK", duration=f(3)); neutral()
+    """cr.MP > st.HP xx OD Psycho Upper > juggle Psycho Blitz (hold 4→6+HK)."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    motion("2", 6); motion("8", 2); od("LP", "HP")
+    wait(230)
+    motion("4", 5); motion("6", 2); press_buttons("HK"); neutral()
 
-def ed_bnb_super():
+def ed_super_1():
+    """cr.MK xx Psycho Cannon Barrage (236236+HP) Lv1."""
+    cr("MK"); cancel(20)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def ed_advanced():
     """
-    Ed BnB into Super — cr.MK xx Psycho Cannon Barrage (236236+HP) Lv1
-    Ed's Level 1 Super. Massive Psycho Power beam, great combo ender damage.
+    ADVANCED — cr.LP > cr.LP > st.MP xx Psycho Blitz (4→6+MK)
+               > Psycho Spark (4→6+HP) > Psycho Cannon Barrage Lv1
+    Triple-cancel route. Psycho Blitz into Spark is a special cancel chain;
+    Spark is then super-cancelled into Cannon Barrage for max damage.
     """
-    motion("2", 2); press_buttons("MK", duration=f(3)); wait(20)
-    qcf(2); qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    hold_charge("4", 3)
+    motion("24", 1); press_buttons("LP", frames=2); wait(35)
+    motion("24", 1); press_buttons("LP", frames=2); wait(35)
+    motion("4", 4); press_buttons("MP", frames=3); wait(25)
+    motion("4", 5); motion("6", 2); press_buttons("MK")  # Psycho Blitz
+    wait(80)
+    motion("4", 5); motion("6", 2); press_buttons("HP")  # Psycho Spark
+    wait(60)
+    qcf(); qcf(); press_buttons("HP"); neutral()          # Cannon Barrage
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  JP COMBOS
+#  ▓▓  JP  ▓▓
 # ══════════════════════════════════════════════════════════════════════════════
-# JP (Judgment Day) is a zoner/puppet character with unique long-range tools.
-# He can summon Amnesia (a puppet) to create screen presence and extend combos.
-# Key specials:
-#   Amnesia Surge    — QCF+P  (summon/detonate Amnesia at distance)
-#   Amnesia Trap     — QCB+P  (place Amnesia trap on screen)
-#   Departure        — 623+K  (DP-like teleport kick)
-#   Consume          — 214+K  (command grab at close range)
-# Super: Interdiction (236236+P) Lv1 — full-screen purple explosion
-# JP's normals hit at long range (his cane extends reach significantly).
-# Combos are simpler than other chars but very damaging due to his power level.
+# JP's normals have extended range (cane). His puppet Amnesia creates screen control.
+# Amnesia Surge (QCF+P) · Amnesia Trap (QCB+P) · Departure (623+K)
+# Consume (214+K — command grab) · Ride the Lightning (Super grab)
+# Super: Interdiction (236236+P) Lv1
 
 def jp_bnb_1():
-    """
-    JP BnB #1 — st.MP > st.HP xx Amnesia Surge (QCF+HP)
-    Core JP combo. Long-range poke chain into his signature purple orb.
-    st.MP > st.HP is a natural chain on hit.
-    """
-    press_buttons("MP", duration=f(3)); neutral(2); wait(45)
-    press_buttons("HP", duration=f(4)); wait(30)
-    qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    """st.MP > st.HP xx Amnesia Surge (QCF+HP) — Core long-range BnB."""
+    st("MP"); link(40)
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("HP"); neutral()
 
 def jp_bnb_2():
-    """
-    JP BnB #2 — cr.LP > cr.MP xx Amnesia Surge (QCF+MP) > Departure (623+HK)
-    Low-poke confirm into double special. Departure (623+HK) adds juggle damage.
-    """
-    motion("2", 2); press_buttons("LP", duration=f(2)); neutral(1); wait(40)
-    motion("2", 2); press_buttons("MP", duration=f(3)); wait(25)
-    # Amnesia Surge: QCF+MP
-    qcf(2); press_buttons("MP", duration=f(3))
-    wait(150)
-    # Departure: 623+HK
-    dp(2); press_buttons("HK", duration=f(3)); neutral()
+    """cr.LP > cr.MP xx Surge (QCF+MP) > Departure (623+HK) — Double special."""
+    cr("LP", frames=2); link(35)
+    cr("MP"); cancel(22)
+    qcf(); press_buttons("MP")
+    wait(140)
+    dp(); press_buttons("HK"); neutral()
 
 def jp_punish_1():
-    """
-    JP Punish #1 — st.HP xx Amnesia Surge (QCF+HP) > Departure (623+MK)
-    JP's best meterless punish. Two-special cancel for big damage and corner push.
-    """
-    press_buttons("HP", duration=f(4)); wait(30)
-    qcf(2); press_buttons("HP", duration=f(3))
+    """st.HP xx Surge (QCF+HP) > Departure (623+MK) — Two-special punish."""
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("HP")
     wait(120)
-    dp(2); press_buttons("MK", duration=f(3)); neutral()
+    dp(); press_buttons("MK"); neutral()
 
 def jp_punish_2():
+    """st.MP > st.HP xx OD Surge > juggle Departure (623+HK) — Drive punish."""
+    st("MP"); link(40)
+    st("HP", frames=4); cancel(28)
+    qcf(); od("LP", "HP")
+    wait(220)
+    dp(); press_buttons("HK"); neutral()
+
+def jp_super_1():
+    """st.HP xx Interdiction (236236+HP) Lv1 — Full-screen super ender."""
+    st("HP", frames=4); cancel(28)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def jp_advanced():
     """
-    JP Optimal Punish #2 — st.MP > st.HP xx OD Amnesia Surge > juggle Departure (623+HK)
-    OD Surge (QCF+LP+HP) detonates on-screen Amnesia for massive juggle damage.
-    Costs one Drive bar. JP's highest punish damage route.
+    ADVANCED — st.MP > st.HP xx OD Surge > juggle Departure HK > Surge HP
+               xx Interdiction Lv1
+    OD Surge launches; Departure adds juggle damage, then Surge HP is
+    super-cancelled into Interdiction for the full punish route.
     """
-    press_buttons("MP", duration=f(3)); neutral(2); wait(45)
-    press_buttons("HP", duration=f(4)); wait(30)
-    # OD Amnesia Surge: QCF + LP+HP
-    qcf(2); press_od("LP", "HP", duration=f(3))
+    st("MP"); link(40)
+    st("HP", frames=4); cancel(28)
+    qcf(); od("LP", "HP")
+    wait(220)
+    dp(); press_buttons("HK")         # Departure juggle
+    wait(160)
+    qcf(); press_buttons("HP")        # Amnesia Surge HP cancel
+    wait(60)
+    qcf(); qcf(); press_buttons("HP"); neutral()   # Interdiction
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▓▓  MARISA  ▓▓
+# ══════════════════════════════════════════════════════════════════════════════
+# Marisa is a grappler/brawler with huge damage on every hit. Slow but devastating.
+# Key specials:
+#   Gladius     — QCF+P  (rushing punch, hits armored)
+#   Dimachaerus — 623+P  (DP-style rising punch, anti-air)
+#   Quadriga    — QCB+P  (charge punch, can be held)
+#   Scutum      — hold HP (parry/absorb stance)
+# Super: Aether (236236+P) Lv1 · Goddess of the Hunt (236236+HP hold) Lv3
+# NOTE: Marisa's normals deal massive stun AND damage — even short combos kill.
+
+def marisa_bnb_1():
+    """cr.MP > st.HP xx Gladius (QCF+HP) — Core BnB, massive damage."""
+    cr("MP"); link(50)
+    st("HP", frames=4); cancel(30)
+    qcf(); press_buttons("HP"); neutral()
+
+def marisa_bnb_2():
+    """cr.LK > cr.LP > cr.MP xx Gladius (QCF+MP) — Low starter confirm."""
+    cr("LK", frames=2); link(40)
+    cr("LP", frames=2); link(40)
+    cr("MP"); cancel(28)
+    qcf(); press_buttons("MP"); neutral()
+
+def marisa_punish_1():
+    """st.HP xx Dimachaerus (623+HP) — Single-hit punish, enormous damage."""
+    st("HP", frames=5); cancel(30)
+    dp(); press_buttons("HP"); neutral()
+
+def marisa_punish_2():
+    """cr.MP > st.HP xx OD Dimachaerus (623+LP+HP) > juggle Gladius HP — Drive punish."""
+    cr("MP"); link(50)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
     wait(230)
-    # Juggle: Departure 623+HK
-    dp(2); press_buttons("HK", duration=f(3)); neutral()
+    qcf(); press_buttons("HP"); neutral()
 
-def jp_bnb_super():
+def marisa_super_1():
+    """st.HP xx Aether (236236+HP) Lv1 — Massive super punish ender."""
+    st("HP", frames=5); cancel(28)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def marisa_advanced():
     """
-    JP BnB into Super — st.HP xx Interdiction (236236+HP) Lv1
-    JP's full-screen Level 1 Super. Enormous damage, screen-filling purple chaos.
-    Works from almost any range thanks to JP's long-range st.HP.
+    ADVANCED — cr.LP > cr.MP > st.HP xx OD Dimachaerus > juggle Gladius HP
+               xx Goddess of the Hunt (236236+HP hold) Lv3
+    Full meter route. OD DP launches into Gladius juggle cancelled into
+    Lv3 Super for screen-shaking maximum damage. Marisa's highest damage combo.
     """
-    press_buttons("HP", duration=f(4)); wait(30)
-    qcf(2); qcf(2); press_buttons("HP", duration=f(3)); neutral()
+    cr("LP", frames=2); link(40)
+    cr("MP"); link(50)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
+    wait(230)
+    qcf(); press_buttons("HP"); cancel(28)
+    # Goddess of the Hunt Lv3: 236236+HP (hold)
+    qcf(); qcf()
+    _press_raw("HP"); gamepad.update()
+    _sleep(f(18))
+    _release_raw("HP"); gamepad.update()
+    neutral()
 
 
-# ─── Combo Registry ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▓▓  LUKE  ▓▓
+# ══════════════════════════════════════════════════════════════════════════════
+# Luke is an MMA-inspired rushdown character. Fast, damaging, great drive usage.
+# Key specials:
+#   Flash Knuckle — hold 4→6+P  (rushing overhand; can be charged for more damage)
+#   Rising Uppercut — 623+P     (DP, very fast, great anti-air)
+#   Avenger       — QCB+K       (overhead rushing kick)
+#   Sand Blast    — QCF+P       (slow fireball, good oki)
+# Super: Vulcan Blast (236236+P) Lv1 · Final Strike (236236+HP charge) Lv3
+# Luke's gameplan: get in, Flash Knuckle pressure, DP on reversal, huge damage.
+
+def luke_bnb_1():
+    """cr.MK xx Flash Knuckle (hold 4→6+MP) — Core BnB, great range."""
+    hold_charge("4", 6)
+    cr("MK"); cancel(20)
+    motion("4", 5); motion("6", 2); press_buttons("MP"); neutral()
+
+def luke_bnb_2():
+    """cr.LP > cr.LP > cr.MK xx Sand Blast (QCF+HP) — Low starter fireball cancel."""
+    cr("LP", frames=2); link(35)
+    cr("LP", frames=2); link(35)
+    cr("MK"); cancel(20)
+    qcf(); press_buttons("HP"); neutral()
+
+def luke_punish_1():
+    """st.HP xx Rising Uppercut (623+HP) — Fast, huge punish damage."""
+    st("HP", frames=4); cancel(30)
+    dp(); press_buttons("HP"); neutral()
+
+def luke_punish_2():
+    """cr.MP > st.HP xx OD Rising Uppercut > juggle Flash Knuckle HP — Drive punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(30)
+    dp(); od("LP", "HP")
+    wait(240)
+    motion("4", 5); motion("6", 2); press_buttons("HP"); neutral()
+
+def luke_super_1():
+    """cr.MK xx Vulcan Blast (236236+HP) Lv1 — Standard super ender."""
+    cr("MK"); cancel(20)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def luke_advanced():
+    """
+    ADVANCED — cr.LP > cr.LP > cr.MK xx OD Flash Knuckle (hold 4→6+LP+MP)
+               > juggle Rising Uppercut HP xx Vulcan Blast Lv1
+    OD Flash Knuckle (charged version) launches on hit in Drive Rush context;
+    Rising Uppercut juggle is super-cancelled into Vulcan Blast for max damage.
+    Requires Drive Gauge + Lv1 super.
+    """
+    hold_charge("4", 4)
+    cr("LP", frames=2); link(32)
+    cr("LP", frames=2); link(32)
+    cr("MK"); cancel(20)
+    motion("4", 6); motion("6", 2); od("LP", "MP")   # OD Flash Knuckle
+    wait(220)
+    dp(); press_buttons("HP"); cancel(25)              # Rising Uppercut juggle
+    qcf(); qcf(); press_buttons("HP"); neutral()       # Vulcan Blast
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▓▓  A.K.I.  ▓▓
+# ══════════════════════════════════════════════════════════════════════════════
+# A.K.I. is a poison/snake-themed zoner-assassin hybrid.
+# She poisons opponents and deals extra damage through poison ticks.
+# Key specials:
+#   Cruel Fate    — QCF+P  (poison claw scratch, applies poison)
+#   Clinging Cobra— QCB+P  (snake fang projectile)
+#   Sinister Slide— QCF+K  (low slide, goes under fireballs)
+#   Nightshade Pulse — 236+K (slow poison explosion)
+# Super: Coronation (236236+P) Lv1 · Serpent's Embrace (214214+P) Lv2
+# NOTE: A.K.I. deals extra damage to poisoned opponents. Open combos with
+#       Cruel Fate to apply poison before extending.
+
+def aki_bnb_1():
+    """cr.LP > cr.MP xx Cruel Fate (QCF+HP) — Applies poison, core BnB."""
+    cr("LP", frames=2); link(38)
+    cr("MP"); cancel(22)
+    qcf(); press_buttons("HP"); neutral()
+
+def aki_bnb_2():
+    """st.MP > st.HP xx Sinister Slide (QCF+MK) — Mid-range low slide cancel."""
+    st("MP"); link(42)
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("MK"); neutral()
+
+def aki_punish_1():
+    """cr.MP > st.HP xx Cruel Fate HP > Clinging Cobra (QCB+HP) — Poison punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); press_buttons("HP")    # Cruel Fate (poison)
+    wait(120)
+    qcb(); press_buttons("HP"); neutral()   # Clinging Cobra follow-up
+
+def aki_punish_2():
+    """cr.MP > st.HP xx OD Cruel Fate > juggle st.HP > Clinging Cobra — Drive punish."""
+    cr("MP"); link(45)
+    st("HP", frames=4); cancel(28)
+    qcf(); od("LP", "HP")
+    wait(210)
+    st("HP", frames=4); cancel(25)
+    qcb(); press_buttons("HP"); neutral()
+
+def aki_super_1():
+    """st.HP xx Coronation (236236+HP) Lv1 — Full-screen super ender."""
+    st("HP", frames=4); cancel(28)
+    qcf(); qcf(); press_buttons("HP"); neutral()
+
+def aki_advanced():
+    """
+    ADVANCED — cr.LP > cr.MP xx Cruel Fate HP (poison) > Clinging Cobra HP
+               > OD Sinister Slide > juggle st.HP xx Coronation Lv1
+    Apply poison first, then extend into an OD slide launcher, juggle,
+    and super cancel. Poison ticks add significant bonus damage throughout.
+    Requires Drive Gauge + Lv1 super.
+    """
+    cr("LP", frames=2); link(38)
+    cr("MP"); cancel(22)
+    qcf(); press_buttons("HP")         # Cruel Fate (poison applied)
+    wait(100)
+    qcb(); press_buttons("HP")         # Clinging Cobra
+    wait(100)
+    qcf(); od("LP", "MK")              # OD Sinister Slide launcher
+    wait(200)
+    st("HP", frames=4); cancel(25)
+    qcf(); qcf(); press_buttons("HP"); neutral()   # Coronation
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▓▓  M. BISON  ▓▓
+# ══════════════════════════════════════════════════════════════════════════════
+# M. Bison is a Psycho Power charge character — one of SF6's most powerful.
+# He uses held-direction charge mechanics extensively.
+# Key specials:
+#   Psycho Crusher  — hold 4→6+P    (torpedo attack, charge)
+#   Scissors Kick   — hold 4→6+K    (rushing kick, charge, his best special)
+#   Devil Reverse   — hold 4→6+K, then up (redirect overhead)
+#   Head Press      — hold 2→8+K    (overhead stomp from air, charge)
+# Super: Knee Press Nightmare (236236+K) Lv1 · Psycho Punisher (236236+P) Lv3
+# NOTE: Bison's charge combos require holding the charge direction during normals.
+
+def bison_bnb_1():
+    """cr.MK xx Scissors Kick MK (hold 4→6+MK) — Core Bison BnB."""
+    hold_charge("4", 8)
+    motion("2", 2); press_buttons("MK", frames=3)   # cr.MK while charging
+    motion("4", 4); motion("6", 2); press_buttons("MK"); neutral()
+
+def bison_bnb_2():
+    """cr.LP > cr.LP > cr.MK xx Psycho Crusher HP (hold 4→6+HP) — Low starter."""
+    hold_charge("4", 6)
+    motion("24", 1); press_buttons("LP", frames=2); wait(35)
+    motion("24", 1); press_buttons("LP", frames=2); wait(35)
+    motion("2", 2); press_buttons("MK", frames=3)
+    motion("4", 4); motion("6", 2); press_buttons("HP"); neutral()
+
+def bison_punish_1():
+    """st.HP xx Scissors Kick HK (hold 4→6+HK) — Big punish, corner carry."""
+    hold_charge("4", 8)
+    st("HP", frames=4); cancel(28)
+    motion("4", 4); motion("6", 2); press_buttons("HK"); neutral()
+
+def bison_punish_2():
+    """cr.MP > st.HP xx OD Scissors Kick > juggle Psycho Crusher HP — Drive punish."""
+    hold_charge("4", 8)
+    cr("MP"); link(48)
+    st("HP", frames=4); cancel(28)
+    motion("4", 5); motion("6", 2); od("MK", "HK")   # OD Scissors
+    wait(230)
+    motion("4", 5); motion("6", 2); press_buttons("HP"); neutral()
+
+def bison_super_1():
+    """cr.MK xx Knee Press Nightmare (236236+HK) Lv1 — Fast super from cr.MK."""
+    cr("MK"); cancel(20)
+    qcf(); qcf(); press_buttons("HK"); neutral()
+
+def bison_advanced():
+    """
+    ADVANCED — cr.LP > cr.MK xx OD Scissors Kick > juggle Scissors HK
+               > Psycho Crusher HP xx Knee Press Nightmare Lv1
+    Full charge + Drive route off a low confirm. OD Scissors launches;
+    Scissors HK juggle charges are maintained, then Psycho Crusher super-cancelled
+    into Knee Press Nightmare for Bison's full punish damage output.
+    """
+    hold_charge("4", 8)
+    motion("24", 1); press_buttons("LP", frames=2); wait(38)
+    motion("2", 2); press_buttons("MK", frames=3)
+    motion("4", 5); motion("6", 2); od("MK", "HK")    # OD Scissors
+    wait(220)
+    # Re-establish charge quickly
+    motion("4", 5); motion("6", 2); press_buttons("HK")  # Scissors juggle
+    wait(160)
+    motion("4", 5); motion("6", 2); press_buttons("HP")  # Psycho Crusher cancel
+    wait(60)
+    qcf(); qcf(); press_buttons("HK"); neutral()          # Knee Press Nightmare
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMBO REGISTRY
+# ══════════════════════════════════════════════════════════════════════════════
+# Each character has 6 combos: F1=BnB1, F2=BnB2, F3=Punish1, F4=Punish2(OD),
+# F5=Super route, F6_ADV=Advanced (GUI button only, not a hotkey)
+
+def _entry(fn, label, slot):
+    return {"fn": fn, "label": label, "slot": slot}
 
 ALL_COMBOS = {
     "Akuma": [
-        {"fn": akuma_bnb_1,    "label": "BnB #1 — cr.MP xx cr.MP xx HP Goshoryuken",     "slot": "F1"},
-        {"fn": akuma_bnb_2,    "label": "BnB #2 — cr.LK > cr.LP > cr.MP xx Gohadouken",  "slot": "F2"},
-        {"fn": akuma_punish_1, "label": "Punish #1 — st.HP xx HP Goshoryuken",            "slot": "F3"},
-        {"fn": akuma_punish_2, "label": "Punish #2 — OD Goshoryuken juggle",              "slot": "F4"},
-        {"fn": akuma_bnb_super,"label": "Super — cr.MP > cr.HP xx Messatsu-Goshoryu",     "slot": "F5"},
+        _entry(akuma_bnb_1,    "BnB #1 — cr.MP > cr.MP xx HP Goshoryuken",            "F1"),
+        _entry(akuma_bnb_2,    "BnB #2 — cr.LK > cr.LP > cr.MP xx Gohadouken",        "F2"),
+        _entry(akuma_punish_1, "Punish #1 — st.HP xx HP Goshoryuken",                  "F3"),
+        _entry(akuma_punish_2, "Punish #2 — OD Goshoryuken > juggle HP DP",            "F4"),
+        _entry(akuma_super_1,  "Super — cr.MP > cr.HP xx Messatsu-Goshoryuken Lv1",    "F5"),
+        _entry(akuma_advanced, "ADV — Low starter > OD Tatsumaki > HP DP",             "ADV"),
     ],
     "Chun-Li": [
-        {"fn": chunli_bnb_1,    "label": "BnB #1 — cr.MK xx Spinning Bird Kick",           "slot": "F1"},
-        {"fn": chunli_bnb_2,    "label": "BnB #2 — cr.LP > cr.LP > cr.MK xx Kikoken",      "slot": "F2"},
-        {"fn": chunli_punish_1, "label": "Punish #1 — st.MP > st.HP xx Hyakuretsukyaku",   "slot": "F3"},
-        {"fn": chunli_punish_2, "label": "Punish #2 — OD SBK juggle",                       "slot": "F4"},
-        {"fn": chunli_bnb_super,"label": "Super — cr.MP > cr.HP xx Kikosho",                "slot": "F5"},
+        _entry(chunli_bnb_1,    "BnB #1 — cr.MK xx Spinning Bird Kick (charge)",       "F1"),
+        _entry(chunli_bnb_2,    "BnB #2 — cr.LP > cr.LP > cr.MK xx Kikoken",           "F2"),
+        _entry(chunli_punish_1, "Punish #1 — st.MP > st.HP xx Hyakuretsukyaku",        "F3"),
+        _entry(chunli_punish_2, "Punish #2 — OD SBK > juggle HP",                      "F4"),
+        _entry(chunli_super_1,  "Super — cr.MP > cr.HP xx Kikosho Lv1",                "F5"),
+        _entry(chunli_advanced, "ADV — Low > OD SBK > Hazan Shu xx Hoyokusen Lv2",    "ADV"),
     ],
     "Mai": [
-        {"fn": mai_bnb_1,    "label": "BnB #1 — cr.LK > cr.LP > st.MP xx Kachousen",     "slot": "F1"},
-        {"fn": mai_bnb_2,    "label": "BnB #2 — st.MP > st.HP xx Ryuuenbu",               "slot": "F2"},
-        {"fn": mai_punish_1, "label": "Punish #1 — cr.MP > st.HP xx Kachousen",           "slot": "F3"},
-        {"fn": mai_punish_2, "label": "Punish #2 — OD Ryuuenbu juggle",                   "slot": "F4"},
-        {"fn": mai_bnb_super,"label": "Super — cr.MP > st.HP xx Hissatsu Shinobibachi",   "slot": "F5"},
+        _entry(mai_bnb_1,    "BnB #1 — cr.LK > cr.LP > st.MP xx Kachousen",           "F1"),
+        _entry(mai_bnb_2,    "BnB #2 — st.MP > st.HP xx Ryuuenbu",                    "F2"),
+        _entry(mai_punish_1, "Punish #1 — cr.MP > st.HP xx Kachousen",                "F3"),
+        _entry(mai_punish_2, "Punish #2 — OD Ryuuenbu > HP > Kachousen",              "F4"),
+        _entry(mai_super_1,  "Super — cr.MP > st.HP xx Hissatsu Shinobibachi Lv1",    "F5"),
+        _entry(mai_advanced, "ADV — Low > OD Ryuuenbu > HP xx Sen'en Ryuuenbu Lv2",  "ADV"),
     ],
     "Ken": [
-        {"fn": ken_bnb_1,    "label": "BnB #1 — cr.MK xx Hadouken",                       "slot": "F1"},
-        {"fn": ken_bnb_2,    "label": "BnB #2 — cr.LP > cr.LP > cr.MK xx Jinrai Kick",    "slot": "F2"},
-        {"fn": ken_punish_1, "label": "Punish #1 — st.MP > st.HP xx HP Shoryuken",        "slot": "F3"},
-        {"fn": ken_punish_2, "label": "Punish #2 — OD Shoryuken > Tatsumaki juggle",      "slot": "F4"},
-        {"fn": ken_bnb_super,"label": "Super — cr.MK xx Shinryuken",                      "slot": "F5"},
+        _entry(ken_bnb_1,    "BnB #1 — cr.MK xx Hadouken",                            "F1"),
+        _entry(ken_bnb_2,    "BnB #2 — cr.LP > cr.LP > cr.MK xx Jinrai Kick",         "F2"),
+        _entry(ken_punish_1, "Punish #1 — st.MP > st.HP xx HP Shoryuken",             "F3"),
+        _entry(ken_punish_2, "Punish #2 — OD Shoryuken > Tatsumaki juggle",           "F4"),
+        _entry(ken_super_1,  "Super — cr.MK xx Shinryuken Lv1",                       "F5"),
+        _entry(ken_advanced, "ADV — OD DP > Jinrai chain xx Shinryuken Lv1",          "ADV"),
     ],
     "Juri": [
-        {"fn": juri_bnb_1,    "label": "BnB #1 — cr.MK > st.HP xx Fuha Release (needs stock)", "slot": "F1"},
-        {"fn": juri_bnb_2,    "label": "BnB #2 — cr.LP > cr.LP > cr.MK xx Shiku-sen",          "slot": "F2"},
-        {"fn": juri_punish_1, "label": "Punish #1 — st.HP xx Fuha Release HP (needs stock)",    "slot": "F3"},
-        {"fn": juri_punish_2, "label": "Punish #2 — OD Shiku-sen > cr.HP > Fuha Release",      "slot": "F4"},
-        {"fn": juri_bnb_super,"label": "Super — cr.MK > st.HP xx Feng Shui Engine",            "slot": "F5"},
+        _entry(juri_bnb_1,    "BnB #1 — cr.MK > st.HP xx Fuha LP ★stock",            "F1"),
+        _entry(juri_bnb_2,    "BnB #2 — cr.LP > cr.LP > cr.MK xx Shiku-sen",         "F2"),
+        _entry(juri_punish_1, "Punish #1 — st.HP xx Fuha HP ★stock",                  "F3"),
+        _entry(juri_punish_2, "Punish #2 — OD Shiku-sen > cr.HP > Fuha",             "F4"),
+        _entry(juri_super_1,  "Super — cr.MK > st.HP xx Feng Shui Engine Lv1",       "F5"),
+        _entry(juri_advanced, "ADV — Low > OD Shiku > cr.HP > Fuha xx FSE Lv3 ★stock","ADV"),
     ],
     "Cammy": [
-        {"fn": cammy_bnb_1,    "label": "BnB #1 — cr.LK > cr.LP > cr.MK xx Spiral Arrow",       "slot": "F1"},
-        {"fn": cammy_bnb_2,    "label": "BnB #2 — st.MP > st.MP > cr.MK xx Spiral Arrow HK",    "slot": "F2"},
-        {"fn": cammy_punish_1, "label": "Punish #1 — st.HP xx Cannon Spike",                     "slot": "F3"},
-        {"fn": cammy_punish_2, "label": "Punish #2 — OD Spiral Arrow > Cannon Spike juggle",     "slot": "F4"},
-        {"fn": cammy_bnb_super,"label": "Super — cr.MK xx Spin Drive Smasher",                   "slot": "F5"},
+        _entry(cammy_bnb_1,    "BnB #1 — cr.LK > cr.LP > cr.MK xx Spiral Arrow",     "F1"),
+        _entry(cammy_bnb_2,    "BnB #2 — st.MP > st.MP > cr.MK xx Spiral Arrow HK",  "F2"),
+        _entry(cammy_punish_1, "Punish #1 — st.HP xx Cannon Spike",                   "F3"),
+        _entry(cammy_punish_2, "Punish #2 — OD Spiral Arrow > Cannon Spike",          "F4"),
+        _entry(cammy_super_1,  "Super — cr.MK xx Spin Drive Smasher Lv1",             "F5"),
+        _entry(cammy_advanced, "ADV — Long chain > OD Spike > QSK xx Delta Red Lv2", "ADV"),
     ],
     "Ryu": [
-        {"fn": ryu_bnb_1,    "label": "BnB #1 — cr.MK xx Hadouken",                             "slot": "F1"},
-        {"fn": ryu_bnb_2,    "label": "BnB #2 — cr.LP > cr.LP > cr.MK xx Hashogeki",            "slot": "F2"},
-        {"fn": ryu_punish_1, "label": "Punish #1 — st.HP xx HP Shoryuken",                      "slot": "F3"},
-        {"fn": ryu_punish_2, "label": "Punish #2 — OD Shoryuken > Tatsumaki juggle",            "slot": "F4"},
-        {"fn": ryu_bnb_super,"label": "Super — cr.MK xx Shin Hashogeki",                        "slot": "F5"},
+        _entry(ryu_bnb_1,    "BnB #1 — cr.MK xx Hadouken",                           "F1"),
+        _entry(ryu_bnb_2,    "BnB #2 — cr.LP > cr.LP > cr.MK xx Hashogeki",          "F2"),
+        _entry(ryu_punish_1, "Punish #1 — st.HP xx HP Shoryuken",                    "F3"),
+        _entry(ryu_punish_2, "Punish #2 — OD Shoryuken > Tatsumaki juggle",          "F4"),
+        _entry(ryu_super_1,  "Super — cr.MK xx Shin Hashogeki Lv1",                  "F5"),
+        _entry(ryu_advanced, "ADV — OD DP > Tatsumaki xx Shin Shoryuken Lv3 (hold)", "ADV"),
     ],
     "Ed": [
-        {"fn": ed_bnb_1,    "label": "BnB #1 — cr.LP > cr.LP > st.MP xx Psycho Blitz",         "slot": "F1"},
-        {"fn": ed_bnb_2,    "label": "BnB #2 — cr.MK xx Flicker > Psycho Spark",               "slot": "F2"},
-        {"fn": ed_punish_1, "label": "Punish #1 — st.HP xx Psycho Upper",                       "slot": "F3"},
-        {"fn": ed_punish_2, "label": "Punish #2 — OD Psycho Upper > Psycho Blitz juggle",      "slot": "F4"},
-        {"fn": ed_bnb_super,"label": "Super — cr.MK xx Psycho Cannon Barrage",                  "slot": "F5"},
+        _entry(ed_bnb_1,    "BnB #1 — cr.LP > cr.LP > st.MP xx Psycho Blitz",        "F1"),
+        _entry(ed_bnb_2,    "BnB #2 — cr.MK xx Flicker > Psycho Spark",              "F2"),
+        _entry(ed_punish_1, "Punish #1 — st.HP xx Psycho Upper",                     "F3"),
+        _entry(ed_punish_2, "Punish #2 — OD Psycho Upper > Psycho Blitz",            "F4"),
+        _entry(ed_super_1,  "Super — cr.MK xx Psycho Cannon Barrage Lv1",            "F5"),
+        _entry(ed_advanced, "ADV — Low > Blitz > Spark xx Cannon Barrage Lv1",       "ADV"),
     ],
     "JP": [
-        {"fn": jp_bnb_1,    "label": "BnB #1 — st.MP > st.HP xx Amnesia Surge",                "slot": "F1"},
-        {"fn": jp_bnb_2,    "label": "BnB #2 — cr.LP > cr.MP xx Surge > Departure",            "slot": "F2"},
-        {"fn": jp_punish_1, "label": "Punish #1 — st.HP xx Surge > Departure",                 "slot": "F3"},
-        {"fn": jp_punish_2, "label": "Punish #2 — OD Amnesia Surge > Departure juggle",        "slot": "F4"},
-        {"fn": jp_bnb_super,"label": "Super — st.HP xx Interdiction",                           "slot": "F5"},
+        _entry(jp_bnb_1,    "BnB #1 — st.MP > st.HP xx Amnesia Surge",               "F1"),
+        _entry(jp_bnb_2,    "BnB #2 — cr.LP > cr.MP xx Surge > Departure",           "F2"),
+        _entry(jp_punish_1, "Punish #1 — st.HP xx Surge > Departure",                "F3"),
+        _entry(jp_punish_2, "Punish #2 — OD Surge > Departure juggle",               "F4"),
+        _entry(jp_super_1,  "Super — st.HP xx Interdiction Lv1",                     "F5"),
+        _entry(jp_advanced, "ADV — OD Surge > Departure > Surge xx Interdiction",    "ADV"),
+    ],
+    "Marisa": [
+        _entry(marisa_bnb_1,    "BnB #1 — cr.MP > st.HP xx Gladius",                 "F1"),
+        _entry(marisa_bnb_2,    "BnB #2 — cr.LK > cr.LP > cr.MP xx Gladius",         "F2"),
+        _entry(marisa_punish_1, "Punish #1 — st.HP xx Dimachaerus",                  "F3"),
+        _entry(marisa_punish_2, "Punish #2 — OD Dimachaerus > Gladius juggle",       "F4"),
+        _entry(marisa_super_1,  "Super — st.HP xx Aether Lv1",                       "F5"),
+        _entry(marisa_advanced, "ADV — Low > OD DP > Gladius xx Goddess Lv3 (hold)", "ADV"),
+    ],
+    "Luke": [
+        _entry(luke_bnb_1,    "BnB #1 — cr.MK xx Flash Knuckle (charge)",            "F1"),
+        _entry(luke_bnb_2,    "BnB #2 — cr.LP > cr.LP > cr.MK xx Sand Blast",        "F2"),
+        _entry(luke_punish_1, "Punish #1 — st.HP xx Rising Uppercut",                "F3"),
+        _entry(luke_punish_2, "Punish #2 — OD Rising Uppercut > Flash Knuckle",      "F4"),
+        _entry(luke_super_1,  "Super — cr.MK xx Vulcan Blast Lv1",                   "F5"),
+        _entry(luke_advanced, "ADV — Low > OD Knuckle > Uppercut xx Vulcan Blast",   "ADV"),
+    ],
+    "A.K.I.": [
+        _entry(aki_bnb_1,    "BnB #1 — cr.LP > cr.MP xx Cruel Fate (poison)",        "F1"),
+        _entry(aki_bnb_2,    "BnB #2 — st.MP > st.HP xx Sinister Slide",             "F2"),
+        _entry(aki_punish_1, "Punish #1 — cr.MP > st.HP xx Cruel Fate > Cobra",      "F3"),
+        _entry(aki_punish_2, "Punish #2 — OD Cruel Fate > HP > Clinging Cobra",      "F4"),
+        _entry(aki_super_1,  "Super — st.HP xx Coronation Lv1",                      "F5"),
+        _entry(aki_advanced, "ADV — Poison > Cobra > OD Slide > HP xx Coronation",   "ADV"),
+    ],
+    "M. Bison": [
+        _entry(bison_bnb_1,    "BnB #1 — cr.MK xx Scissors Kick MK (charge)",        "F1"),
+        _entry(bison_bnb_2,    "BnB #2 — cr.LP > cr.MK xx Psycho Crusher HP",        "F2"),
+        _entry(bison_punish_1, "Punish #1 — st.HP xx Scissors HK (charge)",          "F3"),
+        _entry(bison_punish_2, "Punish #2 — OD Scissors > Psycho Crusher",           "F4"),
+        _entry(bison_super_1,  "Super — cr.MK xx Knee Press Nightmare Lv1",          "F5"),
+        _entry(bison_advanced, "ADV — Low > OD Scissors > Scissors > Crusher xx KPN","ADV"),
     ],
 }
 
 CHARACTER_ORDER = list(ALL_COMBOS.keys())
 
-# ─── State ────────────────────────────────────────────────────────────────────
+# Per-character notes shown in the GUI
+CHAR_NOTES = {
+    "Akuma":    "ADV needs Drive Gauge. OD Tatsumaki corner only.",
+    "Chun-Li":  "F1/F4/ADV need back-charge. ADV needs Drive + Lv2 super.",
+    "Mai":      "ADV needs Drive + Lv2 super meter.",
+    "Ken":      "ADV needs Drive + Lv1 super. Jinrai auto-follows on hit.",
+    "Juri":     "★ = needs 1 pre-stored Fuha stock (press 236+LK first).",
+    "Cammy":    "ADV needs Drive + Lv2 super. OD Spike = 623+LK+HK.",
+    "Ryu":      "ADV needs Drive + Lv3 super. Hold HP for Shin Shoryuken.",
+    "Ed":       "All charge moves: hold direction DURING normals to build charge.",
+    "JP":       "Combos work at close range. Max cane range may drop links.",
+    "Marisa":   "ADV needs Drive + Lv3 super. Even short combos deal huge damage.",
+    "Luke":     "F1/ADV need charge. ADV needs Drive + Lv1 super.",
+    "A.K.I.":  "ADV applies poison first — bonus damage ticks throughout combo.",
+    "M. Bison": "All specials need charge. Hold back DURING normals to maintain it.",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXECUTION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
 current_char_index = 0
-combo_lock = threading.Lock()
-executing = False
-log_callback = None
-char_change_callback = None
+combo_lock  = threading.Lock()
+_executing  = False
+log_cb      = None
+char_cb     = None
+progress_cb = None   # called with (slot_index) when a combo starts
 
-def get_current_char():
+def get_current_char() -> str:
     return CHARACTER_ORDER[current_char_index]
 
-def execute_combo(combo_info):
-    global executing
-    if executing:
-        return
+def _run_combo(combo_info: dict):
+    global _executing
+    _cancel_flag.clear()
     with combo_lock:
-        executing = True
-        char = get_current_char()
-        name = combo_info["label"]
-        if log_callback:
-            log_callback(f"▶ [{char}] {name}")
+        _executing = True
+        char  = get_current_char()
+        label = combo_info["label"]
+        slot  = combo_info["slot"]
+        if log_cb: log_cb(f"▶ [{char}] {label}")
+        if progress_cb: progress_cb(slot)
         try:
             combo_info["fn"]()
-            if log_callback:
-                log_callback(f"✓ Done")
+            if log_cb: log_cb("✓ Complete")
+        except InterruptedError:
+            if log_cb: log_cb("⊘ Cancelled")
+            # Release all inputs cleanly
+            try:
+                _release_raw("LP","MP","HP","LK","MK","HK","LT","LB","RB")
+                neutral(2)
+            except Exception:
+                pass
         except Exception as e:
-            if log_callback:
-                log_callback(f"✗ Error: {e}")
+            if log_cb: log_cb(f"✗ Error: {e}")
         finally:
-            executing = False
+            _executing = False
+            if progress_cb: progress_cb(None)
 
-def fire_slot(slot_index):
-    char = get_current_char()
-    combos = ALL_COMBOS[char]
+def fire_slot(slot_index: int):
+    if _executing:
+        return
+    char   = get_current_char()
+    combos = [c for c in ALL_COMBOS[char] if c["slot"] != "ADV"]
     if slot_index < len(combos):
-        threading.Thread(target=execute_combo, args=(combos[slot_index],), daemon=True).start()
+        threading.Thread(target=_run_combo, args=(combos[slot_index],), daemon=True).start()
 
-def cycle_character(direction=1):
+def fire_advanced():
+    if _executing:
+        return
+    char   = get_current_char()
+    combos = [c for c in ALL_COMBOS[char] if c["slot"] == "ADV"]
+    if combos:
+        threading.Thread(target=_run_combo, args=(combos[0],), daemon=True).start()
+
+def cancel_combo():
+    _cancel_flag.set()
+
+def cycle_character(direction: int = 1):
     global current_char_index
     current_char_index = (current_char_index + direction) % len(CHARACTER_ORDER)
     char = get_current_char()
-    if log_callback:
-        log_callback(f"◈ Character switched to: {char}")
-    if char_change_callback:
-        char_change_callback(char)
+    if log_cb:  log_cb(f"◈ → {char}")
+    if char_cb: char_cb(char)
 
 def register_hotkeys():
-    # F1-F5: fire combo slots 0-4 for current character
     for i, key in enumerate(["F1","F2","F3","F4","F5"]):
         keyboard.add_hotkey(key, lambda idx=i: fire_slot(idx))
-    # F6: next character, F7: previous character
-    keyboard.add_hotkey("F6", lambda: cycle_character(+1))
-    keyboard.add_hotkey("F7", lambda: cycle_character(-1))
+    keyboard.add_hotkey("F6",      lambda: cycle_character(+1))
+    keyboard.add_hotkey("F7",      lambda: cycle_character(-1))
+    keyboard.add_hotkey("F8",      lambda: fire_advanced())
+    keyboard.add_hotkey("escape",  lambda: cancel_combo())
 
 
-# ─── GUI ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  GUI
+# ══════════════════════════════════════════════════════════════════════════════
 
 CHAR_COLORS = {
-    "Akuma":   "#8b2be2",
-    "Chun-Li": "#4fc3f7",
-    "Mai":     "#ff6b35",
-    "Ken":     "#ffcc02",
-    "Juri":    "#e040fb",
-    "Cammy":   "#00e5a0",
-    "Ryu":     "#e8251a",
-    "Ed":      "#3a9bdc",
-    "JP":      "#c8a850",
+    "Akuma":    "#8b2be2",
+    "Chun-Li":  "#4fc3f7",
+    "Mai":      "#ff6b35",
+    "Ken":      "#ffcc02",
+    "Juri":     "#e040fb",
+    "Cammy":    "#00e5a0",
+    "Ryu":      "#e8251a",
+    "Ed":       "#3a9bdc",
+    "JP":       "#c8a850",
+    "Marisa":   "#c0392b",
+    "Luke":     "#27ae60",
+    "A.K.I.":  "#9b59b6",
+    "M. Bison": "#2980b9",
 }
+
+TYPE_LABELS = ["BnB", "BnB", "Punish", "Punish (OD)", "Super", "Advanced"]
 
 class ComboApp(tk.Tk):
     def __init__(self):
@@ -841,154 +1244,170 @@ class ComboApp(tk.Tk):
         self.title("SF6 World Tour Combo Bot")
         self.configure(bg="#09090f")
         self.resizable(False, False)
+        self._active_row = None
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
     def _build_ui(self):
-        # ── Header ──
-        header = tk.Frame(self, bg="#09090f")
-        header.pack(fill="x", padx=20, pady=(16, 0))
-        tk.Label(header, text="SF6", font=("Impact", 38, "bold"),
-                 bg="#09090f", fg="#e8251a").pack(side="left")
-        tk.Label(header, text=" COMBO BOT", font=("Impact", 38),
-                 bg="#09090f", fg="#f0f0f0").pack(side="left")
-        tk.Label(self, text="World Tour Edition  ·  Classic Controls  ·  v3.0",
-                 font=("Consolas", 9), bg="#09090f", fg="#444").pack(anchor="w", padx=22)
+        BG = "#09090f"
 
-        # ── Status ──
-        self.status_var = tk.StringVar(value="● Initializing...")
-        tk.Label(self, textvariable=self.status_var,
-                 font=("Consolas", 10), bg="#111118", fg="#e8251a",
-                 anchor="w", padx=10, pady=5).pack(fill="x", padx=20, pady=(10, 0))
+        # Header
+        hdr = tk.Frame(self, bg=BG); hdr.pack(fill="x", padx=20, pady=(16,0))
+        tk.Label(hdr, text="SF6", font=("Impact",38,"bold"), bg=BG, fg="#e8251a").pack(side="left")
+        tk.Label(hdr, text=" COMBO BOT", font=("Impact",38), bg=BG, fg="#f0f0f0").pack(side="left")
+        tk.Label(self, text="World Tour Edition  ·  Classic Controls  ·  v4.0",
+                 font=("Consolas",9), bg=BG, fg="#444").pack(anchor="w", padx=22)
 
-        # ── Red divider ──
+        # Status bar
+        self.status_var = tk.StringVar(value="● Initializing…")
+        self._status_lbl = tk.Label(self, textvariable=self.status_var,
+                 font=("Consolas",10), bg="#111118", fg="#e8251a",
+                 anchor="w", padx=10, pady=5)
+        self._status_lbl.pack(fill="x", padx=20, pady=(10,0))
+
+        # Divider
         tk.Frame(self, bg="#e8251a", height=2).pack(fill="x", padx=20, pady=8)
 
-        # ── Character selector tabs (two rows for 9 chars) ──
-        tab_outer = tk.Frame(self, bg="#09090f")
-        tab_outer.pack(fill="x", padx=20, pady=(0, 6))
-
-        tk.Label(tab_outer, text="CHARACTER:", font=("Consolas", 9, "bold"),
-                 bg="#09090f", fg="#555").pack(anchor="w", pady=(0, 3))
-
-        ROW_SIZE = 5
+        # Character buttons (3 rows × 5)
+        tab_outer = tk.Frame(self, bg=BG); tab_outer.pack(fill="x", padx=20, pady=(0,6))
+        tk.Label(tab_outer, text="CHARACTER  (F6=Next  F7=Prev  F8=Advanced  ESC=Cancel)",
+                 font=("Consolas",9,"bold"), bg=BG, fg="#555").pack(anchor="w", pady=(0,4))
         self.char_buttons = {}
-        for row_idx in range(0, len(CHARACTER_ORDER), ROW_SIZE):
-            row_frame = tk.Frame(tab_outer, bg="#09090f")
-            row_frame.pack(fill="x", pady=1)
-            for char in CHARACTER_ORDER[row_idx:row_idx + ROW_SIZE]:
-                color = CHAR_COLORS[char]
-                btn = tk.Button(row_frame, text=char,
-                                font=("Consolas", 10, "bold"),
-                                bg="#1a1a28", fg="#888",
-                                activebackground=color, activeforeground="#000",
-                                relief="flat", padx=10, pady=4, cursor="hand2",
-                                command=lambda c=char: self._select_char(c))
-                btn.pack(side="left", padx=2)
-                self.char_buttons[char] = btn
+        ROW = 5
+        for ri in range(0, len(CHARACTER_ORDER), ROW):
+            rf = tk.Frame(tab_outer, bg=BG); rf.pack(fill="x", pady=1)
+            for char in CHARACTER_ORDER[ri:ri+ROW]:
+                col = CHAR_COLORS[char]
+                b = tk.Button(rf, text=char, font=("Consolas",10,"bold"),
+                              bg="#1a1a28", fg="#888",
+                              activebackground=col, activeforeground="#000",
+                              relief="flat", padx=10, pady=4, cursor="hand2",
+                              command=lambda c=char: self._select_char(c))
+                b.pack(side="left", padx=2)
+                self.char_buttons[char] = b
 
-        tk.Label(tab_outer, text="F6 = Next character   F7 = Previous character",
-                 font=("Consolas", 9), bg="#09090f", fg="#333").pack(anchor="w", pady=(3, 0))
-
-        # ── Active character label ──
+        # Active character + Advanced button row
+        char_row = tk.Frame(self, bg=BG); char_row.pack(fill="x", padx=20, pady=(4,0))
         self.active_char_var = tk.StringVar(value="")
-        self.char_label = tk.Label(self, textvariable=self.active_char_var,
-                                   font=("Impact", 20), bg="#09090f", fg="#e8251a",
-                                   anchor="w", padx=22)
-        self.char_label.pack(fill="x")
+        self.char_lbl = tk.Label(char_row, textvariable=self.active_char_var,
+                                 font=("Impact",22), bg=BG, fg="#e8251a", anchor="w")
+        self.char_lbl.pack(side="left")
 
-        # ── Combo table ──
-        tree_frame = tk.Frame(self, bg="#09090f")
-        tree_frame.pack(fill="both", padx=20, pady=(4, 0))
+        self.adv_btn = tk.Button(char_row, text="▶ ADVANCED  [F8]",
+                                 font=("Consolas",10,"bold"),
+                                 bg="#2a1a3a", fg="#e040fb",
+                                 activebackground="#e040fb", activeforeground="#000",
+                                 relief="flat", padx=12, pady=3, cursor="hand2",
+                                 command=lambda: fire_advanced())
+        self.adv_btn.pack(side="right", padx=(0,4))
 
-        style = ttk.Style()
-        style.theme_use("default")
+        # Combo table
+        tf = tk.Frame(self, bg=BG); tf.pack(fill="both", padx=20, pady=(4,0))
+        style = ttk.Style(); style.theme_use("default")
         style.configure("SF6.Treeview",
             background="#111118", foreground="#c0c0c0",
-            fieldbackground="#111118", font=("Consolas", 10), rowheight=28)
+            fieldbackground="#111118", font=("Consolas",10), rowheight=26)
         style.configure("SF6.Treeview.Heading",
             background="#16162a", foreground="#e8251a",
-            font=("Consolas", 10, "bold"), relief="flat")
-        style.map("SF6.Treeview", background=[("selected", "#2a1a2e")])
+            font=("Consolas",10,"bold"), relief="flat")
+        style.map("SF6.Treeview", background=[("selected","#2a1a2e")])
 
-        cols = ("slot", "type", "combo")
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
-                                  style="SF6.Treeview", height=5)
+        self.tree = ttk.Treeview(tf, columns=("slot","type","combo"),
+                                  show="headings", style="SF6.Treeview", height=5)
         self.tree.heading("slot",  text="KEY")
         self.tree.heading("type",  text="TYPE")
         self.tree.heading("combo", text="COMBO ROUTE")
         self.tree.column("slot",  width=55,  anchor="center")
-        self.tree.column("type",  width=100, anchor="center")
-        self.tree.column("combo", width=450, anchor="w")
+        self.tree.column("type",  width=105, anchor="center")
+        self.tree.column("combo", width=460, anchor="w")
         self.tree.pack(fill="both")
 
-        # ── Separator ──
+        # Notes panel
+        note_frame = tk.Frame(self, bg="#0d0d1a"); note_frame.pack(fill="x", padx=20, pady=(4,0))
+        self.notes_var = tk.StringVar(value="")
+        tk.Label(note_frame, textvariable=self.notes_var,
+                 font=("Consolas",9), bg="#0d0d1a", fg="#888",
+                 anchor="w", padx=8, pady=4, wraplength=620, justify="left"
+                 ).pack(fill="x")
+
+        # Settings
         tk.Frame(self, bg="#222", height=1).pack(fill="x", padx=20, pady=8)
-
-        # ── Settings row ──
-        settings = tk.Frame(self, bg="#09090f")
-        settings.pack(fill="x", padx=20, pady=(0, 8))
-
-        tk.Label(settings, text="Frame Scale:", font=("Consolas", 10),
-                 bg="#09090f", fg="#666").pack(side="left")
+        sf = tk.Frame(self, bg=BG); sf.pack(fill="x", padx=20, pady=(0,8))
+        tk.Label(sf, text="Frame Scale:", font=("Consolas",10), bg=BG, fg="#666").pack(side="left")
         self.scale_var = tk.DoubleVar(value=FRAME_SCALE)
-        tk.Spinbox(settings, from_=0.5, to=3.0, increment=0.1,
+        tk.Spinbox(sf, from_=0.5, to=3.0, increment=0.1,
                    textvariable=self.scale_var, width=5,
-                   font=("Consolas", 10), bg="#1a1a2e", fg="#f0f0f0",
+                   font=("Consolas",10), bg="#1a1a2e", fg="#f0f0f0",
                    buttonbackground="#333", relief="flat",
-                   command=self._update_scale).pack(side="left", padx=(6, 16))
-        tk.Label(settings, text="↑ Raise if inputs drop on slow CPUs",
-                 font=("Consolas", 9), bg="#09090f", fg="#333").pack(side="left")
+                   command=self._update_scale).pack(side="left", padx=(6,16))
+        tk.Label(sf, text="Raise if inputs drop. Lower for faster timing.",
+                 font=("Consolas",9), bg=BG, fg="#333").pack(side="left")
 
-        # ── Log ──
-        log_frame = tk.Frame(self, bg="#09090f")
-        log_frame.pack(fill="x", padx=20, pady=(0, 16))
-        tk.Label(log_frame, text="LOG", font=("Consolas", 9, "bold"),
-                 bg="#09090f", fg="#e8251a").pack(anchor="w")
-        self.log_text = tk.Text(log_frame, height=5, bg="#060610", fg="#00ff88",
-                                font=("Consolas", 9), relief="flat",
+        # Log
+        lf = tk.Frame(self, bg=BG); lf.pack(fill="x", padx=20, pady=(0,16))
+        tk.Label(lf, text="LOG", font=("Consolas",9,"bold"), bg=BG, fg="#e8251a").pack(anchor="w")
+        self.log_text = tk.Text(lf, height=5, bg="#060610", fg="#00ff88",
+                                font=("Consolas",9), relief="flat",
                                 state="disabled", cursor="arrow")
         self.log_text.pack(fill="x")
 
-        # Init display
         self._select_char(CHARACTER_ORDER[0])
-        self._log("Bot ready. F1-F5: combos | F6/F7: switch character")
-        self._log("Tip: Raise Frame Scale if combos drop inputs on your PC.")
+        self._log("v4 ready. F1-F5: combos | F6/F7: character | F8: advanced | ESC: cancel")
 
-    def _select_char(self, char):
+    # ── Character selection ────────────────────────────────────────────────────
+
+    def _select_char(self, char: str):
         global current_char_index
         current_char_index = CHARACTER_ORDER.index(char)
-        color = CHAR_COLORS[char]
+        col = CHAR_COLORS[char]
 
-        # Update button highlights
-        for c, btn in self.char_buttons.items():
-            if c == char:
-                btn.configure(bg=color, fg="#000")
-            else:
-                btn.configure(bg="#1a1a28", fg="#888")
+        for c, b in self.char_buttons.items():
+            b.configure(bg=col if c == char else "#1a1a28",
+                        fg="#000" if c == char else "#888")
 
-        self.char_label.configure(text=f"▸ {char.upper()}", fg=color)
+        self.char_lbl.configure(text=f"▸ {char.upper()}", fg=col)
+        self.adv_btn.configure(bg="#2a1a3a", fg=col)
+        self.notes_var.set(f"ℹ  {CHAR_NOTES.get(char, '')}")
 
-        # Rebuild combo table
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        type_labels = ["BnB", "BnB", "Punish", "Punish (OD)", "Super"]
-        for i, combo in enumerate(ALL_COMBOS[char]):
+        non_adv = [c for c in ALL_COMBOS[char] if c["slot"] != "ADV"]
+        for i, combo in enumerate(non_adv):
             tag = "odd" if i % 2 else "even"
-            self.tree.insert("", "end",
-                             values=(combo["slot"], type_labels[i], combo["label"]),
+            self.tree.insert("", "end", iid=f"row_{i}",
+                             values=(combo["slot"], TYPE_LABELS[i], combo["label"]),
                              tags=(tag,))
 
         self.tree.tag_configure("odd",  background="#0e0e1c")
         self.tree.tag_configure("even", background="#111118")
+        self._active_row = None
+
+    def highlight_row(self, slot: str | None):
+        """Highlight the active combo row while executing."""
+        self._active_row = slot
+        non_adv = [c for c in ALL_COMBOS[get_current_char()] if c["slot"] != "ADV"]
+        for i, combo in enumerate(non_adv):
+            iid = f"row_{i}"
+            if combo["slot"] == slot:
+                self.tree.item(iid, tags=("active",))
+                self.tree.tag_configure("active", background="#1a2a1a", foreground="#00ff88")
+            else:
+                tag = "odd" if i % 2 else "even"
+                self.tree.item(iid, tags=(tag,))
+        self.tree.tag_configure("odd",  background="#0e0e1c", foreground="#c0c0c0")
+        self.tree.tag_configure("even", background="#111118", foreground="#c0c0c0")
+
+    # ── Settings & log ────────────────────────────────────────────────────────
 
     def _update_scale(self):
         global FRAME_SCALE
         FRAME_SCALE = self.scale_var.get()
         self._log(f"Frame scale → {FRAME_SCALE:.1f}x")
 
-    def _log(self, msg):
+    def _log(self, msg: str):
         def _do():
             self.log_text.config(state="normal")
             self.log_text.insert("end", msg + "\n")
@@ -996,28 +1415,33 @@ class ComboApp(tk.Tk):
             self.log_text.config(state="disabled")
         self.after(0, _do)
 
-    def set_status(self, msg):
+    def set_status(self, msg: str):
         self.after(0, lambda: self.status_var.set(f"● {msg}"))
 
     def _on_close(self):
+        cancel_combo()
         keyboard.unhook_all()
         self.destroy()
         sys.exit(0)
 
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     app = ComboApp()
 
-    global log_callback, char_change_callback
-    log_callback = app._log
-    char_change_callback = lambda char: app.after(0, lambda: app._select_char(char))
+    global log_cb, char_cb, progress_cb
+    log_cb      = app._log
+    char_cb     = lambda char: app.after(0, lambda: app._select_char(char))
+    progress_cb = lambda slot: app.after(0, lambda: app.highlight_row(slot))
 
     if init_gamepad():
-        app.set_status("Gamepad OK — F1-F5: Combos | F6/F7: Switch Character | 9 Characters loaded")
-        app._log("✓ Virtual Xbox 360 gamepad created.")
-        app._log("✓ Hotkeys: F1-F5 (combos), F6 (next char), F7 (prev char)")
+        n = len(CHARACTER_ORDER)
+        app.set_status(f"Gamepad OK — {n} characters loaded — F1-F5: combo | F6/F7: char | F8: advanced | ESC: cancel")
+        app._log(f"✓ Virtual Xbox 360 gamepad ready. {n} characters, {n*6} combos loaded.")
+        app._log("✓ Hotkeys: F1-F5 combos, F6 next, F7 prev, F8 advanced, ESC cancel.")
         register_hotkeys()
     else:
         app.set_status("ERROR: ViGEmBus not found — install driver first")
