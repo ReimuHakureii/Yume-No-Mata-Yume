@@ -1,3 +1,5 @@
+# DEPRECATED USE THE REFRAMEWORK MOD INSTEAD THIS ONE IS HIGHLY UNSTABLE AND DEPENDS ON AN EXTERNAL TIMER
+
 """
 SF6 Combo Bot v4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
